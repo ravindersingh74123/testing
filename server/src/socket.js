@@ -1,3 +1,28 @@
+// server/src/sockets/meetingSocket.js
+/**
+ * Robust Socket.IO server for meeting (Google Meet clone style)
+ * - Handles join flow (admin vs regular)
+ * - Waiting room + admission workflow
+ * - Permissions updates, screen-share requests
+ * - Chat persistence (uses ChatMessage model)
+ * - WebRTC signaling (offer/answer/ice)
+ * - Clean room lifecycle management and defensive checks
+ *
+ * Drop-in replacement for your previous socket handler. Keep your
+ * Meeting and ChatMessage Mongoose models with expected shape:
+ *   Meeting.findOne({ meetingId }) -> meeting document having:
+ *     - meetingId
+ *     - settings (requireAdmission, muteMicOnEntry, disableVideoOnEntry, allowScreenShare, ...)
+ *     - participants: [{ userId, name, status ('waiting'|'admitted'|'denied'), permissions }]
+ *     - isAdmin(userId) -> boolean helper (or adjust below)
+ *
+ * IMPORTANT: This file focuses on server-side socket logic. Your client should:
+ *  - Only create offers when it receives "meeting-participants" (you are the joiner)
+ *  - Existing participants should NOT create offers in response to "user-joined"
+ *
+ * Exported function: module.exports = (server) => io;
+ */
+
 const { Server } = require("socket.io");
 const Meeting = require("./models/Meeting");
 const ChatMessage = require("./models/ChatMessage");
@@ -12,76 +37,143 @@ module.exports = (server) => {
     pingInterval: 25000,
   });
 
+  // In-memory room state for fast operations. Keys: meetingId -> Map(socketId -> meta)
+  // meta: { socketId, user, userId, isAdmin, status: 'waiting'|'admitted'|'pending', permissions }
   const meetingRooms = new Map();
+
+  // Helps track admitted sockets for each meeting quickly: meetingId -> Set(socketId)
   const admittedParticipants = new Map();
+
+  // Optional: mapping userId -> Set(socketId) (handles multi-tabs)
+  const userSocketIndex = new Map();
+
+  // Clean up interval id so we can clear if needed
+  const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+  const cleanupInterval = setInterval(() => {
+    for (const [meetingId, room] of meetingRooms.entries()) {
+      if (!room || room.size === 0) {
+        meetingRooms.delete(meetingId);
+        admittedParticipants.delete(meetingId);
+        console.log(`🧹 [CLEANUP] Removed empty room: ${meetingId}`);
+      }
+    }
+  }, CLEANUP_INTERVAL_MS);
+
+  // Helper: safe emit (checks existence)
+  function emitToSocket(socketId, event, payload) {
+    const target = io.sockets.sockets.get(socketId);
+    if (target) {
+      target.emit(event, payload);
+    } else {
+      console.warn(`⚠️ [EMIT] Target socket ${socketId} not found for event ${event}`);
+    }
+  }
+
+  // Helper: mark socket -> user index
+  function indexSocketForUser(userId, socketId) {
+    if (!userId) return;
+    if (!userSocketIndex.has(userId)) userSocketIndex.set(userId, new Set());
+    userSocketIndex.get(userId).add(socketId);
+  }
+
+  function deindexSocketForUser(userId, socketId) {
+    if (!userId) return;
+    const s = userSocketIndex.get(userId);
+    if (!s) return;
+    s.delete(socketId);
+    if (s.size === 0) userSocketIndex.delete(userId);
+  }
+
+  // Helper: safe DB read for meeting; returns null if not found
+  async function findMeetingSafe(meetingId) {
+    try {
+      return await Meeting.findOne({ meetingId });
+    } catch (err) {
+      console.error("❌ [DB] Error finding meeting:", err);
+      return null;
+    }
+  }
+
+  // Helper: determine admin - expects meeting.isAdmin(userId) function in model.
+  // If not present, fall back to meeting.hostId or similar.
+  function isUserAdmin(meeting, userId) {
+    try {
+      if (!meeting) return false;
+      if (typeof meeting.isAdmin === "function") return meeting.isAdmin(userId);
+      // fallback: if meeting.hostId exists
+      if (meeting.hostId && meeting.hostId.toString() === userId.toString()) return true;
+      return false;
+    } catch (e) {
+      console.warn("⚠️ [isUserAdmin] Error:", e);
+      return false;
+    }
+  }
 
   io.on("connection", (socket) => {
     console.log("✅ [CONNECTION] User connected:", socket.id);
 
+    // Defensive wrapper: many events depend on meetingId / user object. Validate
     socket.on("join-meeting", async ({ meetingId, user }) => {
-      console.log(
-        `\n🚀 [JOIN-MEETING] ${user.name} (${socket.id}) joining ${meetingId}`
-      );
-
-      if (socket.meetingId === meetingId && socket.userId) {
-        console.log(`⚠️ [DUPLICATE] ${user.name} already in meeting, ignoring`);
-        return;
+      if (!meetingId || !user) {
+        console.warn("⚠️ [JOIN] Missing meetingId or user. Rejecting join.");
+        return socket.emit("join-error", { message: "Missing meetingId or user" });
       }
 
       try {
-        const meeting = await Meeting.findOne({ meetingId });
-
+        const meeting = await findMeetingSafe(meetingId);
         if (!meeting) {
           console.log(`❌ [ERROR] Meeting ${meetingId} not found`);
-          socket.emit("join-error", { message: "Meeting not found" });
-          return;
+          return socket.emit("join-error", { message: "Meeting not found" });
         }
 
+        // Normalize user id
         const userId = user._id || user.id;
-        const isAdmin = meeting.isAdmin(userId);
-        console.log(
-          `👤 [USER] ${user.name}, ID: ${userId}, IsAdmin: ${isAdmin}`
-        );
+        if (!userId) {
+          console.warn("⚠️ [JOIN] User missing id");
+          return socket.emit("join-error", { message: "Invalid user object" });
+        }
 
-        // ALWAYS join the socket.io room first
-        socket.join(meetingId);
+        const isAdmin = isUserAdmin(meeting, userId);
+        console.log(`🚀 [JOIN-MEETING] ${user.name} (${userId}) joining ${meetingId} as ${isAdmin ? "ADMIN" : "USER"} (socket ${socket.id})`);
+
+        // Attach socket metadata
         socket.user = user;
-        socket.meetingId = meetingId;
         socket.userId = userId;
+        socket.meetingId = meetingId;
         socket.isAdmin = isAdmin;
 
-        // Initialize room tracking
+        // Ensure room state exists
         if (!meetingRooms.has(meetingId)) {
-          console.log(`📦 [INIT] Creating room for ${meetingId}`);
           meetingRooms.set(meetingId, new Map());
           admittedParticipants.set(meetingId, new Set());
         }
-
         const room = meetingRooms.get(meetingId);
         const admitted = admittedParticipants.get(meetingId);
 
-        // Add to room tracking immediately
+        // Add to in-memory room tracking right away
         room.set(socket.id, {
           socketId: socket.id,
           user,
           userId,
           isAdmin,
           status: "pending",
+          permissions: null,
         });
 
-        console.log(`📊 [ROOM] Current size: ${room.size}`);
+        indexSocketForUser(userId, socket.id);
 
-        // --- ADMIN FLOW ---
+        // Join socket.io room
+        socket.join(meetingId);
+
+        // ADMIN FLOW
         if (isAdmin) {
-          console.log(`👑 [ADMIN] Admin joining`);
+          console.log(`👑 [ADMIN-JOIN] Admin ${user.name} joined meeting ${meetingId}`);
 
-          let participant = meeting.participants.find(
-            (p) => p.userId.toString() === userId.toString()
-          );
-
+          // Ensure participant entry in DB exists and marked admitted
+          let participant = meeting.participants.find((p) => p.userId.toString() === userId.toString());
           if (!participant) {
-            meeting.participants.push({
-              userId: userId,
+            participant = {
+              userId,
               name: user.name,
               status: "admitted",
               permissions: {
@@ -89,12 +181,12 @@ module.exports = (server) => {
                 canVideo: true,
                 canScreenShare: true,
               },
-            });
+            };
+            meeting.participants.push(participant);
             await meeting.save();
-            participant = meeting.participants[meeting.participants.length - 1];
           } else {
             participant.status = "admitted";
-            participant.permissions = {
+            participant.permissions = participant.permissions || {
               canUnmute: true,
               canVideo: true,
               canScreenShare: true,
@@ -102,45 +194,30 @@ module.exports = (server) => {
             await meeting.save();
           }
 
-          room.get(socket.id).status = "admitted";
-          room.get(socket.id).permissions = participant.permissions;
+          // Update room metadata
+          const meta = room.get(socket.id);
+          meta.status = "admitted";
+          meta.permissions = participant.permissions;
           admitted.add(socket.id);
 
-          console.log(`✅ [ADMIN] Admin admitted, sending meeting-joined`);
+          // Send join success (admin)
           socket.emit("meeting-joined", {
             isAdmin: true,
             permissions: participant.permissions,
-            settings: meeting.settings,
+            settings: meeting.settings || {},
           });
 
           // Send chat history
-          const messages = await ChatMessage.find({ meetingId }).sort({
-            timestamp: 1,
-          });
-          socket.emit("chat-history", messages);
+          const messages = await ChatMessage.find({ meetingId }).sort({ timestamp: 1 });
+          socket.emit("chat-history", messages || []);
 
-          // Get list of OTHER admitted participants
-          const otherAdmitted = Array.from(room.values()).filter(
-            (p) => admitted.has(p.socketId) && p.socketId !== socket.id
-          );
-          console.log(
-            `👥 [ADMIN] Sending ${otherAdmitted.length} existing participants`
-          );
+          // Send list of other admitted participants (excluding this admin socket)
+          const otherAdmitted = Array.from(room.values()).filter((p) => admitted.has(p.socketId) && p.socketId !== socket.id);
           socket.emit("meeting-participants", otherAdmitted);
 
-          // Get current waiting room users from room tracking
-          const waiting = Array.from(room.values()).filter(
-            (p) => p.status === "waiting"
-          );
-          console.log(
-            `⏳ [ADMIN] Current waiting room: ${waiting.length} users`
-          );
-
-          // Send each waiting user as a separate admission request
+          // Send admission requests for waiting users (to admin only)
+          const waiting = Array.from(room.values()).filter((p) => p.status === "waiting");
           waiting.forEach((w) => {
-            console.log(
-              `   -> Sending admission-request for ${w.user.name} (${w.socketId})`
-            );
             socket.emit("admission-request", {
               userId: w.userId,
               name: w.user.name,
@@ -148,7 +225,7 @@ module.exports = (server) => {
             });
           });
 
-          // Notify other admitted participants that admin joined
+          // Notify others that admin joined (so their UI can show a host)
           socket.to(meetingId).emit("user-joined", {
             socketId: socket.id,
             user,
@@ -156,140 +233,111 @@ module.exports = (server) => {
             isAdmin: true,
           });
 
-          console.log(`✅ [ADMIN-COMPLETE] Admin join complete\n`);
           return;
-        }
+        } // end admin flow
 
-        // --- REGULAR USER FLOW ---
-        console.log(`👤 [USER] Regular user joining`);
+        // REGULAR USER FLOW
+        // Admission required?
+        const requireAdmission = meeting.settings?.requireAdmission;
+        let participant = meeting.participants.find((p) => p.userId.toString() === userId.toString());
 
-        // Check if admission is required
-        if (meeting.settings.requireAdmission) {
-          console.log(`🚪 [ADMISSION] Admission required`);
-
-          let participant = meeting.participants.find(
-            (p) => p.userId.toString() === userId.toString()
-          );
-
-          // Create participant if doesn't exist
+        if (requireAdmission) {
+          // Create participant if missing
           if (!participant) {
-            console.log(`➕ [DB] Adding participant to database`);
-            meeting.participants.push({
-              userId: userId,
+            participant = {
+              userId,
               name: user.name,
               status: "waiting",
               permissions: {
-                canUnmute: !meeting.settings.muteMicOnEntry,
-                canVideo: !meeting.settings.disableVideoOnEntry,
+                canUnmute: !meeting.settings?.muteMicOnEntry,
+                canVideo: !meeting.settings?.disableVideoOnEntry,
                 canScreenShare: false,
               },
-            });
+            };
+            meeting.participants.push(participant);
             await meeting.save();
-            participant = meeting.participants[meeting.participants.length - 1];
           }
 
-          console.log(`📋 [STATUS] Participant status: ${participant.status}`);
-
-          // Check current status
+          // If waiting -> waiting room
           if (participant.status === "waiting") {
-            console.log(`⏳ [WAITING] Placing in waiting room`);
+            console.log(`⏳ [WAITING] ${user.name} placed in waiting room for ${meetingId}`);
+            const meta = room.get(socket.id);
+            meta.status = "waiting";
+            meta.permissions = participant.permissions;
 
-            room.get(socket.id).status = "waiting";
-            room.get(socket.id).permissions = participant.permissions;
-
+            // Inform this user they are in waiting room
             socket.emit("waiting-room");
 
-            // FIX: Notify ALL sockets in the meeting room (not just admin flag check)
-            console.log(
-              `📢 [NOTIFY] Broadcasting admission request to meeting room`
-            );
-            const requestData = {
-              userId: userId,
-              name: user.name,
-              socketId: socket.id,
-            };
-
-            // Emit to all OTHER sockets in the room (admins will receive it)
+            // Broadcast admission-request to admins / all sockets in the meeting room.
+            // Admins should listen for "admission-request" and present UI.
+            const requestData = { userId, name: user.name, socketId: socket.id };
+            // Send to room (admins present will receive it)
             io.to(meetingId).emit("admission-request", requestData);
 
-            console.log(
-              `✅ [WAITING-COMPLETE] User in waiting room, broadcasted to all\n`
-            );
             return;
           }
 
           if (participant.status === "denied") {
-            console.log(`🚫 [DENIED] Access denied`);
+            console.log(`🚫 [DENIED] ${user.name} (userId ${userId}) denied access to ${meetingId}`);
             socket.emit("admission-denied");
             room.delete(socket.id);
+            deindexSocketForUser(userId, socket.id);
             socket.leave(meetingId);
             return;
           }
 
-          // Status is 'admitted' - proceed
-          console.log(`✅ [ADMITTED] User already admitted`);
-          room.get(socket.id).status = "admitted";
-          room.get(socket.id).permissions = participant.permissions;
+          // if participant.status === 'admitted', fallthrough to admit below
+          participant.status = "admitted";
+          await meeting.save();
+          const meta = room.get(socket.id);
+          meta.status = "admitted";
+          meta.permissions = participant.permissions;
           admitted.add(socket.id);
         } else {
-          // No admission required - auto-admit
-          console.log(`✅ [AUTO-ADMIT] No admission required`);
-
-          let participant = meeting.participants.find(
-            (p) => p.userId.toString() === userId.toString()
-          );
-
+          // Auto-admit: add to DB if missing or mark admitted
           if (!participant) {
-            meeting.participants.push({
-              userId: userId,
+            participant = {
+              userId,
               name: user.name,
               status: "admitted",
               permissions: {
-                canUnmute: !meeting.settings.muteMicOnEntry,
-                canVideo: !meeting.settings.disableVideoOnEntry,
-                canScreenShare: meeting.settings.allowScreenShare,
+                canUnmute: !meeting.settings?.muteMicOnEntry,
+                canVideo: !meeting.settings?.disableVideoOnEntry,
+                canScreenShare: !!meeting.settings?.allowScreenShare,
               },
-            });
+            };
+            meeting.participants.push(participant);
             await meeting.save();
-            participant = meeting.participants[meeting.participants.length - 1];
           } else {
             participant.status = "admitted";
             await meeting.save();
           }
-
-          room.get(socket.id).status = "admitted";
-          room.get(socket.id).permissions = participant.permissions;
+          const meta = room.get(socket.id);
+          meta.status = "admitted";
+          meta.permissions = participant.permissions;
           admitted.add(socket.id);
         }
 
-        // User is admitted - complete the join
+        // At this point the user is admitted
         const roomData = room.get(socket.id);
-        console.log(`📝 [PERMISSIONS] ${user.name}:`, roomData.permissions);
+        console.log(`✅ [ADMIT] ${user.name} admitted to ${meetingId}`);
 
+        // Emit meeting-joined to the newly admitted user (joiner)
         socket.emit("meeting-joined", {
           isAdmin: false,
           permissions: roomData.permissions,
-          settings: meeting.settings,
+          settings: meeting.settings || {},
         });
 
         // Send chat history
-        const messages = await ChatMessage.find({ meetingId }).sort({
-          timestamp: 1,
-        });
-        socket.emit("chat-history", messages);
+        const messages = await ChatMessage.find({ meetingId }).sort({ timestamp: 1 });
+        socket.emit("chat-history", messages || []);
 
-        // Get list of OTHER admitted participants
-        const otherAdmitted = Array.from(room.values()).filter(
-          (p) => admitted.has(p.socketId) && p.socketId !== socket.id
-        );
-        console.log(
-          `👥 [PARTICIPANTS] Sending ${otherAdmitted.length} participants`
-        );
+        // Send list of other admitted participants (for the joiner to create offers to)
+        const otherAdmitted = Array.from(room.values()).filter((p) => admitted.has(p.socketId) && p.socketId !== socket.id);
         socket.emit("meeting-participants", otherAdmitted);
 
-        // Notify others that user joined
-        console.log(`📢 [BROADCAST] Notifying others of join`);
-
+        // Notify others that user joined AFTER a small delay so joiner receives participants list first.
         setTimeout(() => {
           socket.to(meetingId).emit("user-joined", {
             socketId: socket.id,
@@ -299,237 +347,173 @@ module.exports = (server) => {
           });
         }, 300);
 
-        console.log(`✅ [JOIN-COMPLETE] User join complete\n`);
+        // Done
+        console.log(`✅ [JOIN-COMPLETE] ${user.name} join complete for ${meetingId}`);
       } catch (err) {
         console.error("❌ [ERROR] Join error:", err);
         socket.emit("join-error", { message: "Failed to join meeting" });
       }
-    });
+    }); // end join-meeting
 
-    // NEW: Handle when a user signals they're ready to receive offers
-    socket.on("i-am-ready", ({ meetingId, user }) => {
-      console.log(
-        `\n✅ [I-AM-READY] ${user.name} (${socket.id}) is ready for offers`
-      );
-
-      const room = meetingRooms.get(meetingId);
-      if (!room) return;
-
-      const userData = room.get(socket.id);
-      if (!userData || userData.status !== "admitted") {
-        console.log("⚠️ [READY] User not admitted, ignoring");
-        return;
-      }
-
-      // Notify all OTHER admitted participants that this user is ready
-      console.log("📢 [NOTIFY] Broadcasting peer-ready to meeting");
-      socket.to(meetingId).emit("peer-ready", {
-        socketId: socket.id,
-        user: userData.user,
-      });
-
-      // ALSO broadcast user-joined for good measure
-      socket.to(meetingId).emit("user-joined", {
-        socketId: socket.id,
-        user: userData.user,
-        permissions: userData.permissions,
-        isAdmin: userData.isAdmin || false,
-      });
-
-      console.log("✅ [NOTIFY] Broadcasted peer-ready and user-joined\n");
-    });
-
-    // Admin admits user
+    //
+    // Admin actions: admit / deny / update-permissions / remove-participant
+    //
     socket.on("admit-user", async ({ meetingId, userId, socketId }) => {
-      console.log(
-        `\n👮 [ADMIT] Admin ${socket.id} admitting ${userId} (socket: ${socketId})`
-      );
-
       if (!socket.isAdmin) {
-        console.log(`❌ [ERROR] Not admin`);
+        console.warn("⚠️ [ADMIT] Unauthorized admit attempt by", socket.id);
         return;
       }
+      if (!meetingId || !userId || !socketId) return;
 
       try {
-        const meeting = await Meeting.findOne({ meetingId });
-        const participant = meeting.participants.find(
-          (p) => p.userId.toString() === userId.toString()
-        );
+        const meeting = await findMeetingSafe(meetingId);
+        if (!meeting) return;
 
-        if (participant) {
-          if (participant.status === "admitted") {
-            console.log(`⚠️ [ADMIT] User already admitted`);
-            return;
-          }
-          participant.status = "admitted";
-          await meeting.save();
+        const participant = meeting.participants.find((p) => p.userId.toString() === userId.toString());
+        if (!participant) return;
 
-          const room = meetingRooms.get(meetingId);
-          const admitted = admittedParticipants.get(meetingId);
+        if (participant.status === "admitted") {
+          console.log("⚠️ [ADMIT] Participant already admitted:", userId);
+          return;
+        }
 
-          if (room && room.has(socketId)) {
-            room.get(socketId).status = "admitted";
-            room.get(socketId).permissions = participant.permissions;
-            admitted.add(socketId);
+        participant.status = "admitted";
+        await meeting.save();
 
-            console.log(
-              `✅ [ADMIT] User admitted, notifying socket ${socketId}`
-            );
+        const room = meetingRooms.get(meetingId);
+        const admitted = admittedParticipants.get(meetingId);
+        if (room && room.has(socketId)) {
+          const meta = room.get(socketId);
+          meta.status = "admitted";
+          meta.permissions = participant.permissions;
+          admitted.add(socketId);
 
-            // Send admission granted to user
-            io.to(socketId).emit("admission-granted", {
-              permissions: participant.permissions,
-              settings: meeting.settings,
-            });
+          // Notify the admitted socket
+          emitToSocket(socketId, "admission-granted", {
+            permissions: participant.permissions,
+            settings: meeting.settings || {},
+          });
 
-            // Send chat history to newly admitted user
-            const messages = await ChatMessage.find({ meetingId }).sort({
-              timestamp: 1,
-            });
-            io.to(socketId).emit("chat-history", messages);
+          // Send chat history to the user
+          const messages = await ChatMessage.find({ meetingId }).sort({ timestamp: 1 });
+          emitToSocket(socketId, "chat-history", messages || []);
 
-            // Get OTHER admitted participants to send to newly admitted user
-            const otherAdmitted = Array.from(room.values()).filter(
-              (p) => admitted.has(p.socketId) && p.socketId !== socketId
-            );
+          // Send list of other admitted participants to the newly admitted user
+          const otherAdmitted = Array.from(room.values()).filter((p) => admitted.has(p.socketId) && p.socketId !== socketId);
+          emitToSocket(socketId, "meeting-participants", otherAdmitted);
 
-            console.log(
-              `👥 [ADMIT] Sending ${otherAdmitted.length} participants to admitted user`
-            );
-            io.to(socketId).emit("meeting-participants", otherAdmitted);
-
-            // Notify ALL other participants (including admin) about the new user
-            console.log(`📢 [ADMIT] Broadcasting user-joined to meeting`);
-            const userData = room.get(socketId);
-
+          // Notify all about new admitted user (so clients can display)
+          setTimeout(() => {
             socket.to(meetingId).emit("user-joined", {
-              socketId: socketId,
-              user: userData.user,
+              socketId,
+              user: meta.user,
               permissions: participant.permissions,
               isAdmin: false,
             });
+            io.to(meetingId).emit("user-admitted", { userId, socketId });
+          }, 300);
 
-            // Also broadcast user-admitted event
-            io.to(meetingId).emit("user-admitted", {
-              userId,
-              socketId,
-            });
-
-            console.log(`✅ [ADMIT-COMPLETE] Admission complete\n`);
-          }
+          console.log(`✅ [ADMIT] ${userId} admitted (socket ${socketId})`);
         }
       } catch (err) {
         console.error("❌ [ERROR] Admit error:", err);
       }
     });
 
-    // Admin denies user
     socket.on("deny-user", async ({ meetingId, userId, socketId }) => {
-      console.log(`\n🚫 [DENY] Admin ${socket.id} denying ${userId}`);
-
-      if (!socket.isAdmin) return;
-
+      if (!socket.isAdmin) {
+        console.warn("⚠️ [DENY] Unauthorized deny attempt by", socket.id);
+        return;
+      }
       try {
-        const meeting = await Meeting.findOne({ meetingId });
-        const participant = meeting.participants.find(
-          (p) => p.userId.toString() === userId.toString()
-        );
-
+        const meeting = await findMeetingSafe(meetingId);
+        if (!meeting) return;
+        const participant = meeting.participants.find((p) => p.userId.toString() === userId.toString());
         if (participant) {
           participant.status = "denied";
           await meeting.save();
+        }
 
-          io.to(socketId).emit("admission-denied");
-
-          const room = meetingRooms.get(meetingId);
-          if (room) {
-            room.delete(socketId);
-            const admitted = admittedParticipants.get(meetingId);
-            if (admitted) admitted.delete(socketId);
+        const room = meetingRooms.get(meetingId);
+        if (room && room.has(socketId)) {
+          // notify target and disconnect them
+          emitToSocket(socketId, "admission-denied");
+          const target = io.sockets.sockets.get(socketId);
+          if (target) {
+            target.leave(meetingId);
+            try { target.disconnect(true); } catch (e) {}
           }
-
-          // Force disconnect
-          const targetSocket = io.sockets.sockets.get(socketId);
-          if (targetSocket) {
-            targetSocket.leave(meetingId);
-            targetSocket.disconnect(true);
-          }
+          room.delete(socketId);
+          const admitted = admittedParticipants.get(meetingId);
+          if (admitted) admitted.delete(socketId);
         }
       } catch (err) {
         console.error("❌ [ERROR] Deny error:", err);
       }
     });
 
-    // Update permissions
-    socket.on(
-      "update-permissions",
-      async ({ meetingId, userId, permissions }) => {
-        console.log(`\n🔐 [PERMISSIONS] Updating for ${userId}:`, permissions);
-
-        if (!socket.isAdmin) return;
-
-        try {
-          const meeting = await Meeting.findOne({ meetingId });
-          const participant = meeting.participants.find(
-            (p) => p.userId.toString() === userId.toString()
-          );
-
-          if (participant) {
-            Object.assign(participant.permissions, permissions);
-            await meeting.save();
-
-            const room = meetingRooms.get(meetingId);
-            if (room) {
-              for (const [sid, data] of room.entries()) {
-                if (data.userId.toString() === userId.toString()) {
-                  data.permissions = participant.permissions;
-                  io.to(sid).emit("permissions-updated", permissions);
-                  console.log(`✅ [PERMISSIONS] Updated for socket ${sid}`);
-                  break;
-                }
-              }
-            }
-          }
-        } catch (err) {
-          console.error("❌ [ERROR] Permission update error:", err);
-        }
-      }
-    );
-
-    // Remove participant
-    socket.on("remove-participant", async ({ meetingId, userId }) => {
-      console.log(`\n🗑️ [REMOVE] Removing ${userId}`);
-
+    socket.on("update-permissions", async ({ meetingId, userId, permissions }) => {
       if (!socket.isAdmin) return;
+      if (!meetingId || !userId) return;
+
+      try {
+        const meeting = await findMeetingSafe(meetingId);
+        if (!meeting) return;
+
+        const participant = meeting.participants.find((p) => p.userId.toString() === userId.toString());
+        if (!participant) return;
+
+        participant.permissions = { ...(participant.permissions || {}), ...(permissions || {}) };
+        await meeting.save();
+
+        // Push update to all sockets of the user (multi-tab)
+        const socketsOfUser = userSocketIndex.get(userId);
+        if (socketsOfUser) {
+          for (const sid of socketsOfUser) {
+            emitToSocket(sid, "permissions-updated", participant.permissions);
+            // also update in-room meta if present
+            const room = meetingRooms.get(meetingId);
+            if (room && room.has(sid)) room.get(sid).permissions = participant.permissions;
+          }
+        }
+        console.log(`🔐 [PERMISSIONS] Updated for userId ${userId}`);
+      } catch (err) {
+        console.error("❌ [ERROR] Permission update error:", err);
+      }
+    });
+
+    socket.on("remove-participant", async ({ meetingId, userId }) => {
+      // Admin only
+      if (!socket.isAdmin) return;
+      if (!meetingId || !userId) return;
 
       try {
         const room = meetingRooms.get(meetingId);
         const admitted = admittedParticipants.get(meetingId);
 
         if (room) {
-          for (const [sid, data] of room.entries()) {
+          // find matching sockets for that user and remove them
+          for (const [sid, data] of Array.from(room.entries())) {
             if (data.userId.toString() === userId.toString()) {
-              io.to(sid).emit("removed-by-admin");
+              emitToSocket(sid, "removed-by-admin");
+
               const participantSocket = io.sockets.sockets.get(sid);
               if (participantSocket) {
                 participantSocket.leave(meetingId);
-                participantSocket.disconnect(true);
+                try { participantSocket.disconnect(true); } catch (e) {}
               }
+
               room.delete(sid);
               if (admitted) admitted.delete(sid);
-
-              // Notify others
               io.to(meetingId).emit("user-left", { socketId: sid });
-              break;
             }
           }
         }
 
-        const meeting = await Meeting.findOne({ meetingId });
+        // Remove from DB participants array
+        const meeting = await findMeetingSafe(meetingId);
         if (meeting) {
-          meeting.participants = meeting.participants.filter(
-            (p) => p.userId.toString() !== userId.toString()
-          );
+          meeting.participants = meeting.participants.filter((p) => p.userId.toString() !== userId.toString());
           await meeting.save();
         }
       } catch (err) {
@@ -537,140 +521,164 @@ module.exports = (server) => {
       }
     });
 
-    // Screen share request
     socket.on("request-screen-share", async ({ meetingId }) => {
-      console.log(`\n🖥️ [SCREEN-SHARE] Request from ${socket.id}`);
-
+      if (!meetingId) return;
       try {
-        const meeting = await Meeting.findOne({ meetingId });
-        const participant = meeting.participants.find(
-          (p) => p.userId.toString() === socket.userId.toString()
-        );
-
-        if (
-          socket.isAdmin ||
-          (participant && participant.permissions.canScreenShare)
-        ) {
+        const meeting = await findMeetingSafe(meetingId);
+        const participant = meeting?.participants.find((p) => p.userId.toString() === socket.userId?.toString());
+        if (socket.isAdmin || participant?.permissions?.canScreenShare) {
           socket.emit("screen-share-granted");
         } else {
           socket.emit("screen-share-denied");
         }
       } catch (err) {
-        console.error("❌ [ERROR] Screen share error:", err);
+        console.error("❌ [SCREEN-SHARE-ERROR]", err);
       }
     });
 
-    // Chat
     socket.on("chat-message", async ({ meetingId, message, user }) => {
-      if (!meetingId || !user?._id) return;
-
-      const timestamp = Date.now();
+      if (!meetingId || !message || !user) return;
       try {
-        await ChatMessage.create({
-          meetingId,
-          user: { _id: user._id, name: user.name },
-          message,
-          timestamp,
-        });
+        const timestamp = Date.now();
+        // Persist chat message but swallow DB errors (don't break flow)
+        try {
+          await ChatMessage.create({
+            meetingId,
+            user: { _id: user._id, name: user.name },
+            message,
+            timestamp,
+          });
+        } catch (err) {
+          console.error("❌ [CHAT-SAVE-ERROR]", err);
+        }
+        // Broadcast to room
+        io.to(meetingId).emit("chat-message", { message, user, timestamp });
       } catch (err) {
-        console.error("❌ [ERROR] Chat save error:", err);
+        console.error("❌ [ERROR] chat-message handler", err);
       }
-
-      io.to(meetingId).emit("chat-message", { message, user, timestamp });
     });
 
-    // WebRTC signaling
-    // WebRTC signaling
+    //
+    // WebRTC Signaling - these simply relay to target
+    //
     socket.on("webrtc-offer", ({ to, sdp, fromUser }) => {
-      console.log(`🔗 [OFFER] ${socket.id} -> ${to}`);
-      const targetSocket = io.sockets.sockets.get(to);
-      if (targetSocket) {
-        targetSocket.emit("webrtc-offer", { from: socket.id, sdp, fromUser });
+      if (!to || !sdp) return;
+      const target = io.sockets.sockets.get(to);
+      if (target) {
+        target.emit("webrtc-offer", { from: socket.id, sdp, fromUser });
       } else {
-        console.log(`⚠️ [OFFER] Target socket ${to} not found`);
+        console.warn(`⚠️ [OFFER] Target ${to} not found`);
       }
     });
 
     socket.on("webrtc-answer", ({ to, sdp }) => {
-      console.log(`🔗 [ANSWER] ${socket.id} -> ${to}`);
-      const targetSocket = io.sockets.sockets.get(to);
-      if (targetSocket) {
-        targetSocket.emit("webrtc-answer", { from: socket.id, sdp });
+      if (!to || !sdp) return;
+      const target = io.sockets.sockets.get(to);
+      if (target) {
+        target.emit("webrtc-answer", { from: socket.id, sdp });
       } else {
-        console.log(`⚠️ [ANSWER] Target socket ${to} not found`);
+        console.warn(`⚠️ [ANSWER] Target ${to} not found`);
       }
     });
 
     socket.on("ice-candidate", ({ to, candidate }) => {
-      const targetSocket = io.sockets.sockets.get(to);
-      if (targetSocket) {
-        targetSocket.emit("ice-candidate", { from: socket.id, candidate });
+      if (!to || !candidate) return;
+      const target = io.sockets.sockets.get(to);
+      if (target) {
+        target.emit("ice-candidate", { from: socket.id, candidate });
+      } else {
+        console.warn(`⚠️ [ICE] Target ${to} not found`);
       }
     });
 
+    // Leave meeting explicitly
     socket.on("leave-meeting", ({ meetingId }) => {
-      console.log(`\n👋 [LEAVE] ${socket.id} leaving`);
-      handleUserLeave(socket, meetingId);
-    });
-
-    socket.on("disconnect", () => {
-      console.log(`\n🔌 [DISCONNECT] ${socket.id}`);
-
-      // ✅ ADD: Clean up from database too
-      if (socket.meetingId && socket.userId) {
-        Meeting.findOne({ meetingId: socket.meetingId })
-          .then((meeting) => {
-            if (meeting) {
-              meeting.participants = meeting.participants.filter(
-                (p) =>
-                  p.userId.toString() !== socket.userId.toString() ||
-                  p.status === "waiting" // Keep waiting users
-              );
-              return meeting.save();
-            }
-          })
-          .catch((err) => console.error("❌ [CLEANUP-ERROR]", err));
+      try {
+        console.log(`👋 [LEAVE] ${socket.id} leaving ${meetingId}`);
+        handleUserLeave(socket, meetingId);
+      } catch (e) {
+        console.error("❌ [LEAVE-ERROR]", e);
       }
-
-      if (socket.meetingId) handleUserLeave(socket, socket.meetingId);
     });
 
-    function handleUserLeave(socket, meetingId) {
-      const room = meetingRooms.get(meetingId);
-      const admitted = admittedParticipants.get(meetingId);
+    // Disconnect cleanup
+    socket.on("disconnect", (reason) => {
+      console.log(`🔌 [DISCONNECT] ${socket.id} reason=${reason}`);
+      try {
+        // Clean server-side room tracking only (do not remove DB participant records blindly)
+        if (socket.meetingId) {
+          handleUserLeave(socket, socket.meetingId, { removeDbEntry: false });
+        }
+      } catch (e) {
+        console.error("❌ [DISCONNECT-CLEANUP] Error:", e);
+      }
+      // Deindex socket from user map
+      if (socket.userId) deindexSocketForUser(socket.userId, socket.id);
+    });
 
-      if (room) {
-        const userData = room.get(socket.id);
-        room.delete(socket.id);
-        if (admitted) admitted.delete(socket.id);
+    //
+    // Shared leave handler (used by leave-meeting and disconnect)
+    //
+    function handleUserLeave(socketObj, meetingIdParam, options = { removeDbEntry: false }) {
+      try {
+        const room = meetingRooms.get(meetingIdParam);
+        const admitted = admittedParticipants.get(meetingIdParam);
 
-        // Only notify if user was admitted (not in waiting room)
-        if (userData && userData.status === "admitted") {
-          socket.to(meetingId).emit("user-left", { socketId: socket.id });
+        if (!room) {
+          try { socketObj.leave(meetingIdParam); } catch (e) {}
+          return;
         }
 
+        const meta = room.get(socketObj.id);
+        if (meta) {
+          // Remove socket from room map
+          room.delete(socketObj.id);
+          if (admitted) admitted.delete(socketObj.id);
+
+          // If this socket was admitted, notify others
+          if (meta.status === "admitted") {
+            socketObj.to(meetingIdParam).emit("user-left", { socketId: socketObj.id });
+          }
+        }
+
+        // If no sockets left in room, clean memory maps
         if (room.size === 0) {
-          meetingRooms.delete(meetingId);
-          admittedParticipants.delete(meetingId);
-          console.log(`🗑️ [CLEANUP] Room ${meetingId} deleted`);
+          meetingRooms.delete(meetingIdParam);
+          admittedParticipants.delete(meetingIdParam);
+          console.log(`🗑️ [CLEANUP] Room ${meetingIdParam} deleted`);
         }
-      }
 
-      socket.leave(meetingId);
+        try {
+          socketObj.leave(meetingIdParam);
+        } catch (e) {}
+
+        // Optionally remove from meeting.participants in DB (risky - we prefer explicit admin actions)
+        if (options.removeDbEntry) {
+          // Intentionally left as optional and safe (not called on disconnect by default)
+          (async () => {
+            try {
+              const meeting = await findMeetingSafe(meetingIdParam);
+              if (!meeting) return;
+              meeting.participants = meeting.participants.filter((p) => p.userId.toString() !== (socketObj.userId || "").toString());
+              await meeting.save();
+            } catch (err) {
+              console.error("❌ [DB-REMOVE] Error removing participant on leave", err);
+            }
+          })();
+        }
+      } catch (err) {
+        console.error("❌ [HANDLE-LEAVE] Error:", err);
+      }
     }
+  }); // end io.on('connection')
+
+  // Clear cleanup interval on process exit
+  process.once("SIGINT", () => {
+    clearInterval(cleanupInterval);
+    try { io.close(); } catch (e) {}
+    process.exit(0);
   });
 
-  // Cleanup stale rooms every 5 minutes
-  setInterval(() => {
-    for (const [meetingId, room] of meetingRooms.entries()) {
-      if (room.size === 0) {
-        meetingRooms.delete(meetingId);
-        admittedParticipants.delete(meetingId);
-        console.log(`🧹 [CLEANUP] Removed empty room: ${meetingId}`);
-      }
-    }
-  }, 300000);
-
-  console.log("🚀 [SOCKET.IO] Server initialized");
+  console.log("🚀 [SOCKET.IO] Meeting socket server initialized");
   return io;
 };
