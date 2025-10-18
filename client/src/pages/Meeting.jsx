@@ -1,6 +1,6 @@
 
 
-// src/pages/Meeting.jsx
+// client/src/pages/Meeting.jsx
 import React, { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { socket } from "../services/socket";
@@ -31,9 +31,8 @@ export default function Meeting() {
   const [muted, setMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [sidebarContent, setSidebarContent] = useState('chat'); // 'chat' or 'admin'
+  const [sidebarContent, setSidebarContent] = useState('chat');
 
-  // Admin states
   const [isAdmin, setIsAdmin] = useState(false);
   const [userPermissions, setUserPermissions] = useState({
     canUnmute: true,
@@ -43,15 +42,18 @@ export default function Meeting() {
   const [waitingRoom, setWaitingRoom] = useState([]);
   const [meetingSettings, setMeetingSettings] = useState({});
   
-  // Waiting/Denied states
   const [inWaitingRoom, setInWaitingRoom] = useState(false);
   const [accessDenied, setAccessDenied] = useState(false);
 
   const pendingOffersRef = useRef([]);
   const socketConnectedRef = useRef(false);
+  const isJoiningRef = useRef(false);
 
-  // --- GET LOCAL MEDIA ---
+  console.log("🎬 [MEETING-RENDER] Meeting component rendered");
+
+  // GET LOCAL MEDIA
   useEffect(() => {
+    console.log("📹 [MEDIA] Setting up local media");
     let mounted = true;
     async function startLocal() {
       try {
@@ -59,25 +61,46 @@ export default function Meeting() {
           audio: true,
           video: true,
         });
-        if (!mounted) return;
+        if (!mounted) {
+          console.log("⚠️ [MEDIA] Component unmounted, stopping tracks");
+          stream.getTracks().forEach(t => t.stop());
+          return;
+        }
+        console.log("✅ [MEDIA] Got local stream with tracks:", stream.getTracks().map(t => t.kind));
         setLocalStream(stream);
-        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+          console.log("📺 [MEDIA] Attached stream to video element");
+        }
       } catch (err) {
-        console.error("Camera/Mic error", err);
+        console.error("❌ [MEDIA-ERROR] Camera/Mic error:", err);
         alert("Please allow camera and microphone access.");
       }
     }
     startLocal();
     return () => {
+      console.log("🧹 [MEDIA-CLEANUP] Cleaning up media");
       mounted = false;
     };
   }, []);
 
-  // --- SOCKET CONNECTION & EVENTS ---
+  // SOCKET CONNECTION & EVENTS
   useEffect(() => {
-    if (!meetingId || !storedUser) return;
+    if (!meetingId || !storedUser) {
+      console.log("⚠️ [SOCKET] Missing meetingId or user, skipping socket setup");
+      return;
+    }
+
+    if (isJoiningRef.current) {
+      console.log("⚠️ [SOCKET] Already joining, skipping duplicate setup");
+      return;
+    }
+
+    isJoiningRef.current = true;
+    console.log("\n🔌 [SOCKET] Setting up socket connection for meeting", meetingId);
 
     if (socket.connected) {
+      console.log("🔌 [SOCKET] Already connected, disconnecting first");
       socket.disconnect();
     }
     
@@ -85,7 +108,7 @@ export default function Meeting() {
     socketConnectedRef.current = true;
 
     const handleConnect = () => {
-      console.log("Socket connected, joining meeting");
+      console.log("✅ [SOCKET-CONNECT] Socket connected, emitting join-meeting");
       socket.emit("join-meeting", { meetingId, user: storedUser });
     };
 
@@ -97,7 +120,11 @@ export default function Meeting() {
 
     // Meeting joined successfully
     socket.on("meeting-joined", ({ isAdmin: adminStatus, permissions, settings }) => {
-      console.log("Meeting joined:", { adminStatus, permissions, settings });
+      console.log("🎉 [MEETING-JOINED] Received meeting-joined event");
+      console.log("   Admin:", adminStatus);
+      console.log("   Permissions:", permissions);
+      console.log("   Settings:", settings);
+      
       setIsAdmin(adminStatus);
       setUserPermissions(permissions);
       setMeetingSettings(settings);
@@ -105,12 +132,14 @@ export default function Meeting() {
       
       // Apply initial settings
       if (settings.muteMicOnEntry && !adminStatus) {
+        console.log("🔇 [SETTINGS] Applying muteMicOnEntry");
         setMuted(true);
         if (localStream) {
           localStream.getAudioTracks().forEach(t => t.enabled = false);
         }
       }
       if (settings.disableVideoOnEntry && !adminStatus) {
+        console.log("📹 [SETTINGS] Applying disableVideoOnEntry");
         setCameraOff(true);
         if (localStream) {
           localStream.getVideoTracks().forEach(t => t.enabled = false);
@@ -120,53 +149,70 @@ export default function Meeting() {
 
     // Waiting room
     socket.on("waiting-room", () => {
-      console.log("Placed in waiting room");
+      console.log("⏳ [WAITING-ROOM] Placed in waiting room");
       setInWaitingRoom(true);
     });
 
     // Admission granted
     socket.on("admission-granted", ({ permissions, settings }) => {
-      console.log("Admission granted");
+      console.log("✅ [ADMISSION-GRANTED] Admission granted, re-joining");
+      console.log("   Permissions:", permissions);
       setInWaitingRoom(false);
       setUserPermissions(permissions);
       setMeetingSettings(settings);
+      
+      // Re-emit join-meeting to complete the join process
+      console.log("🔄 [RE-JOIN] Re-emitting join-meeting after admission");
       socket.emit("join-meeting", { meetingId, user: storedUser });
     });
 
     // Admission denied
     socket.on("admission-denied", () => {
-      console.log("Admission denied");
+      console.log("🚫 [ADMISSION-DENIED] Access denied");
       setInWaitingRoom(false);
       setAccessDenied(true);
     });
 
     // Join error
     socket.on("join-error", ({ message }) => {
+      console.error("❌ [JOIN-ERROR]", message);
       alert(message);
       navigate("/");
     });
 
     // Admission request (for admin)
-    socket.on("admission-request", (user) => {
-      console.log("Admission request:", user);
+    socket.on("admission-request", (requestData) => {
+      console.log("📨 [ADMISSION-REQUEST] Received admission request:", requestData);
       setWaitingRoom(prev => {
         // Avoid duplicates
-        if (prev.some(u => u.socketId === user.socketId)) return prev;
-        return [...prev, user];
+        if (prev.some(u => u.socketId === requestData.socketId)) {
+          console.log("   Already in waiting room");
+          return prev;
+        }
+        console.log("   Adding to waiting room");
+        return [...prev, requestData];
       });
+    });
+
+    // User admitted (notify all participants)
+    socket.on("user-admitted", ({ userId, socketId }) => {
+      console.log("✅ [USER-ADMITTED] User was admitted:", userId);
+      setWaitingRoom(prev => prev.filter(u => u.socketId !== socketId));
     });
 
     // Permissions updated
     socket.on("permissions-updated", (permissions) => {
-      console.log("Permissions updated:", permissions);
+      console.log("🔐 [PERMISSIONS-UPDATED] Permissions updated:", permissions);
       setUserPermissions(permissions);
       
       // Enforce permissions
       if (!permissions.canUnmute && localStream) {
+        console.log("🔇 [ENFORCE] Disabling audio tracks");
         localStream.getAudioTracks().forEach(t => t.enabled = false);
         setMuted(true);
       }
       if (!permissions.canVideo && localStream) {
+        console.log("📹 [ENFORCE] Disabling video tracks");
         localStream.getVideoTracks().forEach(t => t.enabled = false);
         setCameraOff(true);
       }
@@ -174,77 +220,108 @@ export default function Meeting() {
 
     // Removed by admin
     socket.on("removed-by-admin", () => {
+      console.log("🚫 [REMOVED] Removed from meeting by admin");
       alert("You have been removed from the meeting by the host.");
       navigate("/");
     });
 
     // Screen share response
     socket.on("screen-share-granted", () => {
+      console.log("✅ [SCREEN-SHARE] Permission granted");
       startScreenShare();
     });
 
     socket.on("screen-share-denied", () => {
+      console.log("🚫 [SCREEN-SHARE] Permission denied");
       alert("Screen share permission denied. Please ask the host for permission.");
     });
 
     socket.on("screen-share-request", ({ userId, name, socketId }) => {
-      // Notify admin of screen share request
-      console.log("Screen share request from:", name);
+      console.log("📨 [SCREEN-SHARE-REQUEST] Request from:", name);
     });
 
     // Chat history
     socket.on("chat-history", (messages) => {
+      console.log(`💬 [CHAT-HISTORY] Received ${messages.length} messages`);
       setChatMessages(messages);
     });
 
     // Chat message
     socket.on("chat-message", ({ message, user, timestamp }) => {
+      console.log(`💬 [CHAT-MESSAGE] New message from ${user.name}`);
       setChatMessages((prev) => {
         const lastMsg = prev[prev.length - 1];
         if (
           lastMsg &&
           lastMsg.message === message &&
           lastMsg.user._id === user._id
-        )
+        ) {
+          console.log("   Duplicate message, ignoring");
           return prev;
+        }
         return [...prev, { message, user, timestamp }];
       });
     });
 
     // Meeting participants
     socket.on("meeting-participants", (list) => {
-      console.log("Received meeting-participants:", list);
-      const others = list.filter((p) => p.socketId !== socket.id);
-      setParticipants(others);
-      others.forEach((p) => {
-        if (localStream) {
-          createOfferTo(p.socketId, p.user);
-        } else {
-          pendingOffersRef.current.push({ socketId: p.socketId, user: p.user });
-        }
+      console.log(`👥 [MEETING-PARTICIPANTS] Received ${list.length} participants`);
+      list.forEach(p => {
+        console.log(`   - ${p.user.name} (${p.socketId})`);
       });
+      
+      setParticipants(list);
+      
+      // Create offers to all participants
+      if (localStream) {
+        console.log("🔗 [OFFERS] Creating offers to all participants");
+        list.forEach((p) => {
+          createOfferTo(p.socketId, p.user);
+        });
+      } else {
+        console.log("⏳ [PENDING-OFFERS] No local stream yet, queuing offers");
+        list.forEach((p) => {
+          pendingOffersRef.current.push({ socketId: p.socketId, user: p.user });
+        });
+      }
     });
 
     // User joined
-    socket.on("user-joined", ({ socketId, user, permissions }) => {
-      console.log("User joined:", socketId, user);
+    socket.on("user-joined", ({ socketId, user, permissions, isAdmin: userIsAdmin }) => {
+      console.log(`👋 [USER-JOINED] User ${user.name} joined (${socketId})`);
+      console.log("   Permissions:", permissions);
+      console.log("   IsAdmin:", userIsAdmin);
+      
       setParticipants((prev) => {
-        if (prev.some((x) => x.socketId === socketId)) return prev;
-        return [...prev, { socketId, user, permissions }];
+        if (prev.some((x) => x.socketId === socketId)) {
+          console.log("   User already in participants list");
+          return prev;
+        }
+        console.log("   Adding to participants list");
+        return [...prev, { socketId, user, permissions, isAdmin: userIsAdmin }];
       });
-      if (localStream) createOfferTo(socketId, user);
-      else pendingOffersRef.current.push({ socketId, user });
+      
+      if (localStream) {
+        console.log("🔗 [OFFER] Creating offer to new user");
+        createOfferTo(socketId, user);
+      } else {
+        console.log("⏳ [PENDING-OFFER] Queuing offer until local stream ready");
+        pendingOffersRef.current.push({ socketId, user });
+      }
     });
 
     // User left
     socket.on("user-left", ({ socketId }) => {
-      console.log("User left:", socketId);
+      console.log(`👋 [USER-LEFT] User left: ${socketId}`);
       setParticipants((prev) => prev.filter((p) => p.socketId !== socketId));
       setWaitingRoom(prev => prev.filter(u => u.socketId !== socketId));
+      
       if (pcsRef.current[socketId]) {
+        console.log("🧹 [CLEANUP] Closing peer connection for", socketId);
         pcsRef.current[socketId].close();
         delete pcsRef.current[socketId];
       }
+      
       setPeers((prev) => {
         const updated = { ...prev };
         delete updated[socketId];
@@ -254,43 +331,62 @@ export default function Meeting() {
 
     // WebRTC signaling
     socket.on("webrtc-offer", async ({ from, sdp, fromUser }) => {
-      console.log("Received offer from:", from, fromUser);
+      console.log(`📨 [WEBRTC-OFFER] Received offer from ${from} (${fromUser?.name})`);
+      
       if (pcsRef.current[from]) {
-        console.log("PC already exists for:", from);
+        console.log("⚠️ [WEBRTC] PC already exists for", from);
         return;
       }
-      const pc = createPeerConnection(from, fromUser);
-      pcsRef.current[from] = pc;
-      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit("webrtc-answer", { to: from, sdp: pc.localDescription });
+      
+      try {
+        const pc = createPeerConnection(from, fromUser);
+        pcsRef.current[from] = pc;
+        
+        console.log("🔗 [WEBRTC] Setting remote description");
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        
+        console.log("🔗 [WEBRTC] Creating answer");
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        
+        console.log("📤 [WEBRTC] Sending answer to", from);
+        socket.emit("webrtc-answer", { to: from, sdp: pc.localDescription });
+      } catch (err) {
+        console.error("❌ [WEBRTC-OFFER-ERROR]", err);
+      }
     });
 
     socket.on("webrtc-answer", async ({ from, sdp }) => {
-      console.log("Received answer from:", from);
+      console.log(`📨 [WEBRTC-ANSWER] Received answer from ${from}`);
       const pc = pcsRef.current[from];
       if (!pc) {
-        console.log("No PC found for answer from:", from);
+        console.log("⚠️ [WEBRTC] No PC found for answer from", from);
         return;
       }
-      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      try {
+        console.log("🔗 [WEBRTC] Setting remote description");
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      } catch (err) {
+        console.error("❌ [WEBRTC-ANSWER-ERROR]", err);
+      }
     });
 
     socket.on("ice-candidate", async ({ from, candidate }) => {
+      console.log(`🧊 [ICE-CANDIDATE] From ${from}`);
       const pc = pcsRef.current[from];
       if (!pc) {
-        console.log("No PC found for ICE candidate from:", from);
+        console.log("⚠️ [ICE] No PC found for candidate from", from);
         return;
       }
       try {
         await pc.addIceCandidate(new RTCIceCandidate(candidate));
       } catch (e) {
-        console.error("Error adding ICE candidate", e);
+        console.error("❌ [ICE-ERROR]", e);
       }
     });
 
     return () => {
+      console.log("\n🧹 [SOCKET-CLEANUP] Cleaning up socket listeners");
       socket.off("connect", handleConnect);
       socket.off("meeting-joined");
       socket.off("waiting-room");
@@ -298,6 +394,7 @@ export default function Meeting() {
       socket.off("admission-denied");
       socket.off("join-error");
       socket.off("admission-request");
+      socket.off("user-admitted");
       socket.off("permissions-updated");
       socket.off("removed-by-admin");
       socket.off("screen-share-granted");
@@ -313,54 +410,68 @@ export default function Meeting() {
       socket.off("user-left");
       socket.disconnect();
       socketConnectedRef.current = false;
+      isJoiningRef.current = false;
+      
+      console.log("🧹 [CLEANUP] Closing all peer connections");
       Object.values(pcsRef.current).forEach((pc) => pc.close());
       pcsRef.current = {};
       setPeers({});
     };
-  }, [meetingId, localStream, navigate]);
+  }, [meetingId, navigate]);
 
+  // Process pending offers when local stream becomes available
   useEffect(() => {
     if (!localStream) return;
-    const pending = pendingOffersRef.current.splice(
-      0,
-      pendingOffersRef.current.length
-    );
-    pending.forEach(({ socketId, user }) => {
-      createOfferTo(socketId, user);
-    });
+    
+    const pending = pendingOffersRef.current.splice(0, pendingOffersRef.current.length);
+    if (pending.length > 0) {
+      console.log(`🔗 [PENDING-OFFERS] Processing ${pending.length} pending offers`);
+      pending.forEach(({ socketId, user }) => {
+        createOfferTo(socketId, user);
+      });
+    }
   }, [localStream]);
 
-  // --- CREATE PEER CONNECTION ---
+  // CREATE PEER CONNECTION
   function createPeerConnection(remoteSocketId, remoteUser = null) {
-    console.log("Creating peer connection for:", remoteSocketId, remoteUser);
+    console.log(`🔗 [CREATE-PC] Creating peer connection for ${remoteSocketId} (${remoteUser?.name})`);
     const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
 
     if (localStream) {
+      console.log("📤 [PC] Adding local tracks to PC");
       localStream.getTracks().forEach((t) => {
-        console.log("Adding local track to PC:", t.kind);
+        console.log(`   - Adding ${t.kind} track`);
         pc.addTrack(t, localStream);
       });
+    } else {
+      console.log("⚠️ [PC] No local stream to add");
     }
 
     const remoteStream = new MediaStream();
+    
     pc.ontrack = (ev) => {
-      console.log("Received remote track:", ev.track.kind, "from:", remoteSocketId);
+      console.log(`📥 [PC-TRACK] Received ${ev.track.kind} track from ${remoteSocketId}`);
       ev.streams?.[0]?.getTracks().forEach((t) => {
-        console.log("Adding track to remote stream:", t.kind);
+        console.log(`   - Adding ${t.kind} to remote stream`);
         remoteStream.addTrack(t);
       });
-      setPeers((prev) => ({
-        ...prev,
-        [remoteSocketId]: {
-          pc,
-          stream: remoteStream,
-          user: remoteUser || prev?.[remoteSocketId]?.user || null,
-        },
-      }));
+      
+      setPeers((prev) => {
+        console.log(`📊 [PEERS] Updating peers state for ${remoteSocketId}`);
+        return {
+          ...prev,
+          [remoteSocketId]: {
+            pc,
+            stream: remoteStream,
+            user: remoteUser || prev?.[remoteSocketId]?.user || null,
+          },
+        };
+      });
     };
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
+        console.log(`🧊 [ICE] Sending candidate to ${remoteSocketId}`);
         socket.emit("ice-candidate", {
           to: remoteSocketId,
           candidate: e.candidate,
@@ -369,8 +480,9 @@ export default function Meeting() {
     };
 
     pc.onconnectionstatechange = () => {
-      console.log("Connection state changed:", pc.connectionState, "for:", remoteSocketId);
+      console.log(`🔌 [PC-STATE] Connection state changed to ${pc.connectionState} for ${remoteSocketId}`);
       if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+        console.log(`🧹 [PC-CLEANUP] Cleaning up failed connection for ${remoteSocketId}`);
         setPeers((prev) => {
           const copy = { ...prev };
           delete copy[remoteSocketId];
@@ -395,11 +507,12 @@ export default function Meeting() {
     return pc;
   }
 
-  // --- CREATE OFFER ---
+  // CREATE OFFER
   async function createOfferTo(remoteSocketId, remoteUser = null) {
-    console.log("Creating offer to:", remoteSocketId, remoteUser);
+    console.log(`📞 [OFFER] Creating offer to ${remoteSocketId} (${remoteUser?.name})`);
+    
     if (pcsRef.current[remoteSocketId]) {
-      console.log("PC already exists, skipping offer creation");
+      console.log("⚠️ [OFFER] PC already exists, skipping offer creation");
       return;
     }
 
@@ -407,24 +520,25 @@ export default function Meeting() {
     pcsRef.current[remoteSocketId] = pc;
 
     try {
+      console.log("🔗 [OFFER] Creating offer");
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      
+      console.log("📤 [OFFER] Sending offer to", remoteSocketId);
       socket.emit("webrtc-offer", {
         to: remoteSocketId,
         sdp: pc.localDescription,
         fromUser: storedUser,
       });
-      console.log("Offer sent to:", remoteSocketId);
     } catch (err) {
-      console.error("Error creating offer to", remoteSocketId, err);
+      console.error("❌ [OFFER-ERROR] Error creating offer to", remoteSocketId, err);
     }
   }
 
-  // --- CONTROLS ---
+  // CONTROLS
   function toggleMute() {
     if (!localStream) return;
     
-    // Check permission
     if (!userPermissions.canUnmute && muted) {
       alert("You don't have permission to unmute. Please ask the host.");
       return;
@@ -432,13 +546,14 @@ export default function Meeting() {
     
     const tracks = localStream.getAudioTracks();
     tracks.forEach((t) => (t.enabled = !t.enabled));
-    setMuted(tracks.length ? !tracks[0].enabled : false);
+    const newMuted = tracks.length ? !tracks[0].enabled : false;
+    console.log(`🎤 [CONTROLS] Mic ${newMuted ? 'muted' : 'unmuted'}`);
+    setMuted(newMuted);
   }
 
   function toggleCamera() {
     if (!localStream) return;
     
-    // Check permission
     if (!userPermissions.canVideo && cameraOff) {
       alert("You don't have permission to enable video. Please ask the host.");
       return;
@@ -446,12 +561,14 @@ export default function Meeting() {
     
     const tracks = localStream.getVideoTracks();
     tracks.forEach((t) => (t.enabled = !t.enabled));
-    setCameraOff(tracks.length ? !tracks[0].enabled : false);
+    const newCameraOff = tracks.length ? !tracks[0].enabled : false;
+    console.log(`📹 [CONTROLS] Camera ${newCameraOff ? 'off' : 'on'}`);
+    setCameraOff(newCameraOff);
   }
 
   async function handleScreenShare() {
-    // Check permission
     if (!userPermissions.canScreenShare && !isAdmin) {
+      console.log("📨 [SCREEN-SHARE] Requesting permission");
       socket.emit("request-screen-share", { meetingId });
       alert("Screen share request sent to the host.");
       return;
@@ -461,18 +578,26 @@ export default function Meeting() {
   }
 
   async function startScreenShare() {
+    console.log("🖥️ [SCREEN-SHARE] Starting screen share");
     if (!navigator.mediaDevices.getDisplayMedia)
       return alert("Screen sharing not supported.");
+    
     try {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
       });
       const screenTrack = screenStream.getVideoTracks()[0];
+      
+      console.log("🔄 [SCREEN-SHARE] Replacing video tracks in all peer connections");
       Object.values(pcsRef.current).forEach((pc) => {
         const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-        if (sender) sender.replaceTrack(screenTrack);
+        if (sender) {
+          sender.replaceTrack(screenTrack);
+        }
       });
+      
       screenTrack.onended = () => {
+        console.log("🛑 [SCREEN-SHARE] Screen share ended, restoring camera");
         if (!localStream) return;
         const camTrack = localStream.getVideoTracks()[0];
         Object.values(pcsRef.current).forEach((pc) => {
@@ -481,11 +606,11 @@ export default function Meeting() {
         });
       };
     } catch (err) {
-      console.error("Screen share failed", err);
+      console.error("❌ [SCREEN-SHARE-ERROR]", err);
     }
   }
 
-  // --- SEND CHAT ---
+  // SEND CHAT
   async function sendChat(message) {
     if (!message?.trim()) return;
     const user = storedUser;
@@ -493,11 +618,12 @@ export default function Meeting() {
 
     const userId = user._id || user.id;
     if (!userId) {
-      console.error("User object is missing id:", user);
+      console.error("❌ [CHAT] User object is missing id:", user);
       alert("Error: User ID is missing. Please log in again.");
       return;
     }
 
+    console.log(`💬 [CHAT-SEND] Sending message: "${message}"`);
     socket.emit("chat-message", {
       meetingId,
       message,
@@ -508,21 +634,23 @@ export default function Meeting() {
     });
   }
 
-  // --- ADMIN FUNCTIONS ---
+  // ADMIN FUNCTIONS
   function handleAdmitUser(userId, socketId) {
+    console.log(`👮 [ADMIN-ADMIT] Admitting user ${userId} (${socketId})`);
     socket.emit("admit-user", { meetingId, userId, socketId });
     setWaitingRoom(prev => prev.filter(u => u.socketId !== socketId));
   }
 
   function handleDenyUser(userId, socketId) {
+    console.log(`👮 [ADMIN-DENY] Denying user ${userId} (${socketId})`);
     socket.emit("deny-user", { meetingId, userId, socketId });
     setWaitingRoom(prev => prev.filter(u => u.socketId !== socketId));
   }
 
   function handleUpdatePermissions(userId, permissions) {
+    console.log(`👮 [ADMIN-PERMISSIONS] Updating permissions for ${userId}`, permissions);
     socket.emit("update-permissions", { meetingId, userId, permissions });
     
-    // Update local participant list
     setParticipants(prev => 
       prev.map(p => {
         const pUserId = p.user._id || p.user.id;
@@ -536,11 +664,13 @@ export default function Meeting() {
 
   function handleRemoveParticipant(userId) {
     if (window.confirm("Are you sure you want to remove this participant?")) {
+      console.log(`👮 [ADMIN-REMOVE] Removing participant ${userId}`);
       socket.emit("remove-participant", { meetingId, userId });
     }
   }
 
   async function handleUpdateSettings(settings) {
+    console.log(`👮 [ADMIN-SETTINGS] Updating settings`, settings);
     try {
       const token = localStorage.getItem("token");
       const response = await fetch(`/api/admin/${meetingId}/settings`, {
@@ -554,22 +684,25 @@ export default function Meeting() {
 
       if (response.ok) {
         setMeetingSettings(settings);
+        console.log("✅ [ADMIN-SETTINGS] Settings updated successfully");
         alert("Settings updated successfully!");
       } else {
+        console.error("❌ [ADMIN-SETTINGS] Failed to update settings");
         alert("Failed to update settings");
       }
     } catch (err) {
-      console.error("Error updating settings:", err);
+      console.error("❌ [ADMIN-SETTINGS-ERROR]", err);
       alert("Failed to update settings");
     }
   }
 
   function handleLeave() {
+    console.log("👋 [LEAVE] Leaving meeting");
     socket.emit("leave-meeting", { meetingId });
     navigate("/");
   }
 
-  // --- RENDER WAITING ROOM ---
+  // RENDER WAITING ROOM
   if (inWaitingRoom) {
     return (
       <WaitingRoom 
@@ -579,12 +712,12 @@ export default function Meeting() {
     );
   }
 
-  // --- RENDER ACCESS DENIED ---
+  // RENDER ACCESS DENIED
   if (accessDenied) {
     return <AccessDenied onGoBack={() => navigate("/")} />;
   }
 
-  // --- RENDER MAIN MEETING ---
+  // RENDER MAIN MEETING
   return (
     <div className="h-screen flex flex-col bg-gradient-to-br from-slate-900 via-gray-900 to-slate-800 text-white overflow-hidden">
       <div className="flex-shrink-0 border-b border-gray-700/50 backdrop-blur-sm bg-gray-900/80">
@@ -616,7 +749,6 @@ export default function Meeting() {
           }`}
         >
           <div className="h-full flex flex-col">
-            {/* Sidebar Tabs */}
             {isAdmin && (
               <div className="flex-shrink-0 flex border-b border-gray-700">
                 <button
