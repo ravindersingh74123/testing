@@ -498,13 +498,16 @@
 //   );
 // }
 
-
-
-
-
 import React from "react";
 
-export default function VideoGrid({ localVideoRef, peers, participants, user, muted, cameraOff }) {
+export default function VideoGrid({
+  localVideoRef,
+  peers,
+  participants,
+  user,
+  muted,
+  cameraOff,
+}) {
   // peers: { socketId: { pc: RTCPeerConnection, stream: MediaStream, user } }
   // participants: { socketId, user: { name, id } }[]
 
@@ -526,7 +529,9 @@ export default function VideoGrid({ localVideoRef, peers, participants, user, mu
   return (
     <div className="flex-1 overflow-auto bg-[#1E1E1E] rounded-xl p-4">
       <div
-        className={`grid ${getGridClass(totalParticipants)} gap-4 place-items-center`}
+        className={`grid ${getGridClass(
+          totalParticipants
+        )} gap-4 place-items-center`}
       >
         {/* Local Video */}
         <div className="bg-black rounded-lg relative overflow-hidden w-full aspect-video">
@@ -535,7 +540,9 @@ export default function VideoGrid({ localVideoRef, peers, participants, user, mu
             autoPlay
             muted
             playsInline
-            className={`w-full h-full object-cover ${cameraOff ? "opacity-50" : ""}`}
+            className={`w-full h-full object-cover ${
+              cameraOff ? "opacity-50" : ""
+            }`}
           />
           <div className="absolute bottom-2 left-2 bg-black/60 text-white text-sm px-2 py-1 rounded-md flex items-center gap-1">
             {user?.name || "You"} (You)
@@ -557,10 +564,37 @@ function PeerTile({ stream, name }) {
   const videoRef = React.useRef(null);
 
   React.useEffect(() => {
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
+    const videoNode = videoRef.current;
+    if (!videoNode || !stream) return;
+
+    console.log(
+      `📺 [VIDEO] Attaching stream to peer tile:`,
+      stream.getTracks().map((t) => t.kind)
+    );
+    videoNode.srcObject = stream;
+
+    // Force play
+    const playPromise = videoNode.play();
+    if (playPromise !== undefined) {
+      playPromise
+        .then(() => {
+          console.log(`✅ [VIDEO] Video playing for ${name}`);
+        })
+        .catch((err) => {
+          console.warn(`⚠️ [VIDEO] Play failed for ${name}:`, err);
+          // Retry play
+          setTimeout(() => {
+            videoNode.play().catch(() => {});
+          }, 100);
+        });
     }
-  }, [stream]);
+
+    return () => {
+      if (videoNode) {
+        videoNode.srcObject = null;
+      }
+    };
+  }, [stream, name]);
 
   return (
     <div className="bg-black rounded-lg relative overflow-hidden w-full aspect-video">
