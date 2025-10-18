@@ -1,3 +1,6 @@
+
+// server/src/socket.js
+// server/src/socket.js
 const { Server } = require("socket.io");
 const Meeting = require("./models/Meeting");
 const ChatMessage = require("./models/ChatMessage");
@@ -320,8 +323,19 @@ module.exports = (server) => {
       console.log("📢 [NOTIFY] Broadcasting peer-ready to meeting");
       socket.to(meetingId).emit("peer-ready", {
         socketId: socket.id,
-        user,
+        user: userData.user,
       });
+
+      socket.to(meetingId).emit("user-joined", {
+        socketId: socket.id,
+        user: userData.user,
+        permissions: userData.permissions,
+        isAdmin: userData.isAdmin || false,
+      });
+
+      console.log(
+        "✅ [NOTIFY] Broadcasted peer-ready and user-joined to meeting"
+      );
     });
 
     // Admin admits user
