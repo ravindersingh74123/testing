@@ -20,6 +20,64 @@ router.get("/:id/messages", async (req, res) => {
 });
 
 
+
+router.post("/:id/screen-share", async (req, res) => {
+  const { userId, allow } = req.body;
+  const { id } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(userId)) {
+    return res.status(400).json({ message: "Invalid user ID" });
+  }
+
+  try {
+    const meeting = await Meeting.findOne({ meetingId: id });
+    if (!meeting) return res.status(404).json({ message: "Meeting not found" });
+
+    if (allow) {
+      if (!meeting.screenShareUsers.includes(userId)) {
+        meeting.screenShareUsers.push(userId);
+      }
+    } else {
+      meeting.screenShareUsers = meeting.screenShareUsers.filter((u) => u.toString() !== userId);
+    }
+
+    await meeting.save();
+    return res.json({ message: "Screen share permission updated", meeting });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+// Allow or deny user from joining meeting
+router.post("/:id/allow-user", async (req, res) => {
+  const { userId, allow } = req.body;
+  const { id } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(userId)) {
+    return res.status(400).json({ message: "Invalid user ID" });
+  }
+
+  try {
+    const meeting = await Meeting.findOne({ meetingId: id });
+    if (!meeting) return res.status(404).json({ message: "Meeting not found" });
+
+    if (allow) {
+      if (!meeting.allowedUsers.includes(userId)) {
+        meeting.allowedUsers.push(userId);
+      }
+    } else {
+      meeting.allowedUsers = meeting.allowedUsers.filter((u) => u.toString() !== userId);
+    }
+
+    await meeting.save();
+    return res.json({ message: "User permission updated", meeting });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
 // Create a new meeting
 router.post("/", async (req, res) => {
   const { meetingId, createdBy } = req.body;

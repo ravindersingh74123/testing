@@ -1,4 +1,4 @@
-// index.js
+// server/src/index.js
 require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
@@ -6,6 +6,7 @@ const cors = require("cors");
 const http = require("http");
 const meetingsRouter = require("./routes/meetingsRoutes");
 const usersRouter = require("./routes/users");
+const adminRouter = require("./routes/adminRoutes");
 const socketHandler = require("./socket");
 
 const app = express();
@@ -14,6 +15,7 @@ app.use(express.json());
 
 app.use("/api/users", usersRouter);
 app.use("/api/meetings", meetingsRouter);
+app.use("/api/admin", adminRouter);
 
 // Handle unmatched routes
 app.use((req, res) => res.status(404).json({ message: "Route not found" }));

@@ -1,15 +1,18 @@
+
+
 // src/pages/Meeting.jsx
 import React, { useEffect, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useNavigate } from "react-router-dom";
 import { socket } from "../services/socket";
 import VideoGrid from "../components/VideoGrid";
 import Controls from "../components/Controls";
 import ChatPanel from "../components/ChatPanel";
 import TopBar from "../components/TopBar";
+import AdminPanel from "../components/AdminPanel";
+import WaitingRoom, { AccessDenied } from "../components/WaitingRoomModal";
 
 const storedUser = JSON.parse(localStorage.getItem("user"));
 
-// Normalize user object to always use _id
 if (storedUser && storedUser.id && !storedUser._id) {
   storedUser._id = storedUser.id;
 }
@@ -18,6 +21,7 @@ const STUN_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
 export default function Meeting() {
   const { id: meetingId } = useParams();
+  const navigate = useNavigate();
   const localVideoRef = useRef(null);
   const [localStream, setLocalStream] = useState(null);
   const [peers, setPeers] = useState({});
@@ -27,6 +31,21 @@ export default function Meeting() {
   const [muted, setMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarContent, setSidebarContent] = useState('chat'); // 'chat' or 'admin'
+
+  // Admin states
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [userPermissions, setUserPermissions] = useState({
+    canUnmute: true,
+    canVideo: true,
+    canScreenShare: true,
+  });
+  const [waitingRoom, setWaitingRoom] = useState([]);
+  const [meetingSettings, setMeetingSettings] = useState({});
+  
+  // Waiting/Denied states
+  const [inWaitingRoom, setInWaitingRoom] = useState(false);
+  const [accessDenied, setAccessDenied] = useState(false);
 
   const pendingOffersRef = useRef([]);
   const socketConnectedRef = useRef(false);
@@ -58,7 +77,6 @@ export default function Meeting() {
   useEffect(() => {
     if (!meetingId || !storedUser) return;
 
-    // Force fresh connection on mount
     if (socket.connected) {
       socket.disconnect();
     }
@@ -66,7 +84,6 @@ export default function Meeting() {
     socket.connect();
     socketConnectedRef.current = true;
 
-    // Wait for connection before joining
     const handleConnect = () => {
       console.log("Socket connected, joining meeting");
       socket.emit("join-meeting", { meetingId, user: storedUser });
@@ -78,14 +95,110 @@ export default function Meeting() {
       socket.on("connect", handleConnect);
     }
 
-    // Load chat history
-    const handleChatHistory = (messages) => {
-      setChatMessages(messages);
-    };
-    socket.on("chat-history", handleChatHistory);
+    // Meeting joined successfully
+    socket.on("meeting-joined", ({ isAdmin: adminStatus, permissions, settings }) => {
+      console.log("Meeting joined:", { adminStatus, permissions, settings });
+      setIsAdmin(adminStatus);
+      setUserPermissions(permissions);
+      setMeetingSettings(settings);
+      setInWaitingRoom(false);
+      
+      // Apply initial settings
+      if (settings.muteMicOnEntry && !adminStatus) {
+        setMuted(true);
+        if (localStream) {
+          localStream.getAudioTracks().forEach(t => t.enabled = false);
+        }
+      }
+      if (settings.disableVideoOnEntry && !adminStatus) {
+        setCameraOff(true);
+        if (localStream) {
+          localStream.getVideoTracks().forEach(t => t.enabled = false);
+        }
+      }
+    });
 
-    // Handle new chat messages
-    const handleChatMessage = ({ message, user, timestamp }) => {
+    // Waiting room
+    socket.on("waiting-room", () => {
+      console.log("Placed in waiting room");
+      setInWaitingRoom(true);
+    });
+
+    // Admission granted
+    socket.on("admission-granted", ({ permissions, settings }) => {
+      console.log("Admission granted");
+      setInWaitingRoom(false);
+      setUserPermissions(permissions);
+      setMeetingSettings(settings);
+      socket.emit("join-meeting", { meetingId, user: storedUser });
+    });
+
+    // Admission denied
+    socket.on("admission-denied", () => {
+      console.log("Admission denied");
+      setInWaitingRoom(false);
+      setAccessDenied(true);
+    });
+
+    // Join error
+    socket.on("join-error", ({ message }) => {
+      alert(message);
+      navigate("/");
+    });
+
+    // Admission request (for admin)
+    socket.on("admission-request", (user) => {
+      console.log("Admission request:", user);
+      setWaitingRoom(prev => {
+        // Avoid duplicates
+        if (prev.some(u => u.socketId === user.socketId)) return prev;
+        return [...prev, user];
+      });
+    });
+
+    // Permissions updated
+    socket.on("permissions-updated", (permissions) => {
+      console.log("Permissions updated:", permissions);
+      setUserPermissions(permissions);
+      
+      // Enforce permissions
+      if (!permissions.canUnmute && localStream) {
+        localStream.getAudioTracks().forEach(t => t.enabled = false);
+        setMuted(true);
+      }
+      if (!permissions.canVideo && localStream) {
+        localStream.getVideoTracks().forEach(t => t.enabled = false);
+        setCameraOff(true);
+      }
+    });
+
+    // Removed by admin
+    socket.on("removed-by-admin", () => {
+      alert("You have been removed from the meeting by the host.");
+      navigate("/");
+    });
+
+    // Screen share response
+    socket.on("screen-share-granted", () => {
+      startScreenShare();
+    });
+
+    socket.on("screen-share-denied", () => {
+      alert("Screen share permission denied. Please ask the host for permission.");
+    });
+
+    socket.on("screen-share-request", ({ userId, name, socketId }) => {
+      // Notify admin of screen share request
+      console.log("Screen share request from:", name);
+    });
+
+    // Chat history
+    socket.on("chat-history", (messages) => {
+      setChatMessages(messages);
+    });
+
+    // Chat message
+    socket.on("chat-message", ({ message, user, timestamp }) => {
       setChatMessages((prev) => {
         const lastMsg = prev[prev.length - 1];
         if (
@@ -96,10 +209,9 @@ export default function Meeting() {
           return prev;
         return [...prev, { message, user, timestamp }];
       });
-    };
-    socket.on("chat-message", handleChatMessage);
+    });
 
-    // Handle meeting participants
+    // Meeting participants
     socket.on("meeting-participants", (list) => {
       console.log("Received meeting-participants:", list);
       const others = list.filter((p) => p.socketId !== socket.id);
@@ -113,21 +225,22 @@ export default function Meeting() {
       });
     });
 
-    // When a new user joins
-    socket.on("user-joined", ({ socketId, user }) => {
+    // User joined
+    socket.on("user-joined", ({ socketId, user, permissions }) => {
       console.log("User joined:", socketId, user);
       setParticipants((prev) => {
         if (prev.some((x) => x.socketId === socketId)) return prev;
-        return [...prev, { socketId, user }];
+        return [...prev, { socketId, user, permissions }];
       });
       if (localStream) createOfferTo(socketId, user);
       else pendingOffersRef.current.push({ socketId, user });
     });
 
-    // When a user leaves
+    // User left
     socket.on("user-left", ({ socketId }) => {
       console.log("User left:", socketId);
       setParticipants((prev) => prev.filter((p) => p.socketId !== socketId));
+      setWaitingRoom(prev => prev.filter(u => u.socketId !== socketId));
       if (pcsRef.current[socketId]) {
         pcsRef.current[socketId].close();
         delete pcsRef.current[socketId];
@@ -139,6 +252,7 @@ export default function Meeting() {
       });
     });
 
+    // WebRTC signaling
     socket.on("webrtc-offer", async ({ from, sdp, fromUser }) => {
       console.log("Received offer from:", from, fromUser);
       if (pcsRef.current[from]) {
@@ -177,8 +291,20 @@ export default function Meeting() {
     });
 
     return () => {
-      socket.off("chat-history", handleChatHistory);
-      socket.off("chat-message", handleChatMessage);
+      socket.off("connect", handleConnect);
+      socket.off("meeting-joined");
+      socket.off("waiting-room");
+      socket.off("admission-granted");
+      socket.off("admission-denied");
+      socket.off("join-error");
+      socket.off("admission-request");
+      socket.off("permissions-updated");
+      socket.off("removed-by-admin");
+      socket.off("screen-share-granted");
+      socket.off("screen-share-denied");
+      socket.off("screen-share-request");
+      socket.off("chat-history");
+      socket.off("chat-message");
       socket.off("meeting-participants");
       socket.off("user-joined");
       socket.off("webrtc-offer");
@@ -191,7 +317,7 @@ export default function Meeting() {
       pcsRef.current = {};
       setPeers({});
     };
-  }, [meetingId, localStream]);
+  }, [meetingId, localStream, navigate]);
 
   useEffect(() => {
     if (!localStream) return;
@@ -257,7 +383,6 @@ export default function Meeting() {
       }
     };
 
-    // Initialize peer state immediately
     setPeers((prev) => ({
       ...prev,
       [remoteSocketId]: {
@@ -298,6 +423,13 @@ export default function Meeting() {
   // --- CONTROLS ---
   function toggleMute() {
     if (!localStream) return;
+    
+    // Check permission
+    if (!userPermissions.canUnmute && muted) {
+      alert("You don't have permission to unmute. Please ask the host.");
+      return;
+    }
+    
     const tracks = localStream.getAudioTracks();
     tracks.forEach((t) => (t.enabled = !t.enabled));
     setMuted(tracks.length ? !tracks[0].enabled : false);
@@ -305,9 +437,27 @@ export default function Meeting() {
 
   function toggleCamera() {
     if (!localStream) return;
+    
+    // Check permission
+    if (!userPermissions.canVideo && cameraOff) {
+      alert("You don't have permission to enable video. Please ask the host.");
+      return;
+    }
+    
     const tracks = localStream.getVideoTracks();
     tracks.forEach((t) => (t.enabled = !t.enabled));
     setCameraOff(tracks.length ? !tracks[0].enabled : false);
+  }
+
+  async function handleScreenShare() {
+    // Check permission
+    if (!userPermissions.canScreenShare && !isAdmin) {
+      socket.emit("request-screen-share", { meetingId });
+      alert("Screen share request sent to the host.");
+      return;
+    }
+    
+    startScreenShare();
   }
 
   async function startScreenShare() {
@@ -319,14 +469,14 @@ export default function Meeting() {
       });
       const screenTrack = screenStream.getVideoTracks()[0];
       Object.values(pcsRef.current).forEach((pc) => {
-        const sender = pc.getSenders().find((s) => s.track.kind === "video");
+        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
         if (sender) sender.replaceTrack(screenTrack);
       });
       screenTrack.onended = () => {
         if (!localStream) return;
         const camTrack = localStream.getVideoTracks()[0];
         Object.values(pcsRef.current).forEach((pc) => {
-          const sender = pc.getSenders().find((s) => s.track.kind === "video");
+          const sender = pc.getSenders().find((s) => s.track?.kind === "video");
           if (sender) sender.replaceTrack(camTrack);
         });
       };
@@ -358,7 +508,83 @@ export default function Meeting() {
     });
   }
 
-  // --- RENDER ---
+  // --- ADMIN FUNCTIONS ---
+  function handleAdmitUser(userId, socketId) {
+    socket.emit("admit-user", { meetingId, userId, socketId });
+    setWaitingRoom(prev => prev.filter(u => u.socketId !== socketId));
+  }
+
+  function handleDenyUser(userId, socketId) {
+    socket.emit("deny-user", { meetingId, userId, socketId });
+    setWaitingRoom(prev => prev.filter(u => u.socketId !== socketId));
+  }
+
+  function handleUpdatePermissions(userId, permissions) {
+    socket.emit("update-permissions", { meetingId, userId, permissions });
+    
+    // Update local participant list
+    setParticipants(prev => 
+      prev.map(p => {
+        const pUserId = p.user._id || p.user.id;
+        if (pUserId === userId) {
+          return { ...p, permissions };
+        }
+        return p;
+      })
+    );
+  }
+
+  function handleRemoveParticipant(userId) {
+    if (window.confirm("Are you sure you want to remove this participant?")) {
+      socket.emit("remove-participant", { meetingId, userId });
+    }
+  }
+
+  async function handleUpdateSettings(settings) {
+    try {
+      const token = localStorage.getItem("token");
+      const response = await fetch(`/api/admin/${meetingId}/settings`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({ settings })
+      });
+
+      if (response.ok) {
+        setMeetingSettings(settings);
+        alert("Settings updated successfully!");
+      } else {
+        alert("Failed to update settings");
+      }
+    } catch (err) {
+      console.error("Error updating settings:", err);
+      alert("Failed to update settings");
+    }
+  }
+
+  function handleLeave() {
+    socket.emit("leave-meeting", { meetingId });
+    navigate("/");
+  }
+
+  // --- RENDER WAITING ROOM ---
+  if (inWaitingRoom) {
+    return (
+      <WaitingRoom 
+        userName={storedUser?.name}
+        onCancel={() => navigate("/")}
+      />
+    );
+  }
+
+  // --- RENDER ACCESS DENIED ---
+  if (accessDenied) {
+    return <AccessDenied onGoBack={() => navigate("/")} />;
+  }
+
+  // --- RENDER MAIN MEETING ---
   return (
     <div className="h-screen flex flex-col bg-gradient-to-br from-slate-900 via-gray-900 to-slate-800 text-white overflow-hidden">
       <div className="flex-shrink-0 border-b border-gray-700/50 backdrop-blur-sm bg-gray-900/80">
@@ -390,47 +616,64 @@ export default function Meeting() {
           }`}
         >
           <div className="h-full flex flex-col">
-            <div className="flex-shrink-0 px-6 py-4 border-b border-gray-700/50 bg-gray-800/50 backdrop-blur-sm">
-              <div className="flex items-center justify-between">
-                <h2 className="text-lg font-semibold text-gray-100">
-                  Meeting Chat
-                </h2>
+            {/* Sidebar Tabs */}
+            {isAdmin && (
+              <div className="flex-shrink-0 flex border-b border-gray-700">
                 <button
-                  onClick={() => setSidebarOpen(false)}
-                  className="lg:hidden p-2 hover:bg-gray-700/50 rounded-lg transition-colors duration-200"
-                  aria-label="Close chat"
+                  onClick={() => setSidebarContent('chat')}
+                  className={`flex-1 py-3 px-4 font-medium transition-colors ${
+                    sidebarContent === 'chat'
+                      ? 'bg-gray-700 text-white border-b-2 border-blue-500'
+                      : 'text-gray-400 hover:bg-gray-800'
+                  }`}
                 >
-                  <svg
-                    className="w-5 h-5"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M6 18L18 6M6 6l12 12"
-                    />
-                  </svg>
+                  Chat
+                </button>
+                <button
+                  onClick={() => setSidebarContent('admin')}
+                  className={`flex-1 py-3 px-4 font-medium transition-colors relative ${
+                    sidebarContent === 'admin'
+                      ? 'bg-gray-700 text-white border-b-2 border-blue-500'
+                      : 'text-gray-400 hover:bg-gray-800'
+                  }`}
+                >
+                  Admin
+                  {waitingRoom.length > 0 && (
+                    <span className="absolute top-2 right-2 bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
+                      {waitingRoom.length}
+                    </span>
+                  )}
                 </button>
               </div>
-              <p className="text-xs text-gray-400 mt-1">
-                {participants.length + 1} participant
-                {participants.length !== 0 ? "s" : ""}
-              </p>
-            </div>
+            )}
 
             <div className="flex-1 overflow-hidden">
-              <ChatPanel messages={chatMessages} onSend={sendChat} />
+              {sidebarContent === 'chat' ? (
+                <ChatPanel 
+                  messages={chatMessages} 
+                  onSend={sendChat}
+                  user={storedUser}
+                  onClose={() => setSidebarOpen(false)}
+                />
+              ) : (
+                <AdminPanel
+                  participants={participants}
+                  waitingRoom={waitingRoom}
+                  isAdmin={isAdmin}
+                  onAdmitUser={handleAdmitUser}
+                  onDenyUser={handleDenyUser}
+                  onUpdatePermissions={handleUpdatePermissions}
+                  onRemoveParticipant={handleRemoveParticipant}
+                  onUpdateSettings={handleUpdateSettings}
+                  currentSettings={meetingSettings}
+                />
+              )}
             </div>
 
             <div className="flex-shrink-0 p-4 border-t border-gray-700/50 bg-gray-800/30">
               <button
                 className="w-full py-3 bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 rounded-xl font-medium shadow-lg hover:shadow-red-500/25 transition-all duration-200 transform hover:scale-[1.02] active:scale-[0.98]"
-                onClick={() =>
-                  alert("Leave meeting functionality can be implemented here")
-                }
+                onClick={handleLeave}
               >
                 Leave Meeting
               </button>
@@ -454,22 +697,36 @@ export default function Meeting() {
                 <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
                 <span className="font-medium">Connected</span>
               </div>
+              {isAdmin && (
+                <span className="px-2 py-1 bg-yellow-600/20 text-yellow-500 rounded text-xs font-semibold">
+                  HOST
+                </span>
+              )}
             </div>
 
             <div className="flex-1 flex justify-center">
               <Controls
                 muted={muted}
                 cameraOff={cameraOff}
+                isChatOpen={sidebarOpen}
                 onToggleMute={toggleMute}
                 onToggleCamera={toggleCamera}
-                onScreenShare={startScreenShare}
+                onScreenShare={handleScreenShare}
+                onLeave={handleLeave}
+                onToggleChat={() => setSidebarOpen(!sidebarOpen)}
+                permissions={userPermissions}
               />
             </div>
 
             <div className="flex items-center gap-2">
               <button
                 className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 rounded-xl font-medium shadow-lg hover:shadow-blue-500/25 transition-all duration-200 transform hover:scale-[1.02] active:scale-[0.98]"
-                onClick={() => setSidebarOpen(!sidebarOpen)}
+                onClick={() => {
+                  setSidebarOpen(!sidebarOpen);
+                  if (!sidebarOpen && isAdmin) {
+                    setSidebarContent('chat');
+                  }
+                }}
               >
                 <svg
                   className="w-5 h-5"
@@ -485,8 +742,13 @@ export default function Meeting() {
                   />
                 </svg>
                 <span className="hidden sm:inline">
-                  {sidebarOpen ? "Hide" : "Show"} Chat
+                  {sidebarOpen ? "Hide" : "Show"} {isAdmin && sidebarOpen ? sidebarContent.charAt(0).toUpperCase() + sidebarContent.slice(1) : "Chat"}
                 </span>
+                {isAdmin && waitingRoom.length > 0 && !sidebarOpen && (
+                  <span className="bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
+                    {waitingRoom.length}
+                  </span>
+                )}
               </button>
             </div>
           </div>
