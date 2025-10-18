@@ -208,51 +208,20 @@ export default function Meeting() {
 
     // Admission granted
     socket.on("admission-granted", ({ permissions, settings }) => {
-      console.log("✅ [ADMISSION-GRANTED] Admission granted, re-joining");
-      console.log("   Permissions:", permissions);
+      console.log("✅ [ADMISSION-GRANTED] Admission granted");
       setInWaitingRoom(false);
       setUserPermissions(permissions);
       setMeetingSettings(settings);
 
-      // CRITICAL FIX: Wait for local stream to be ready before re-joining
-      const waitForStreamAndRejoin = () => {
-        console.log("⏳ [RE-JOIN] Checking if local stream is ready");
+      // DON'T re-join, just signal we're ready
+      console.log(
+        "📢 [SIGNAL-READY] Notifying peers we're ready after admission"
+      );
 
-        if (
-          !localStream ||
-          !localStream.active ||
-          localStream.getTracks().length === 0
-        ) {
-          console.log("⏳ [RE-JOIN] Local stream not ready, waiting...");
-          setTimeout(waitForStreamAndRejoin, 200);
-          return;
-        }
-
-        // Verify all tracks are live
-        const audioTracks = localStream
-          .getAudioTracks()
-          .filter((t) => t.readyState === "live");
-        const videoTracks = localStream
-          .getVideoTracks()
-          .filter((t) => t.readyState === "live");
-
-        if (audioTracks.length === 0 || videoTracks.length === 0) {
-          console.log("⏳ [RE-JOIN] Waiting for all tracks to be live");
-          setTimeout(waitForStreamAndRejoin, 200);
-          return;
-        }
-
-        console.log("✅ [RE-JOIN] Local stream fully ready with live tracks");
-        console.log(
-          `   Audio tracks: ${audioTracks.length}, Video tracks: ${videoTracks.length}`
-        );
-
-        // Now it's safe to re-join
-        socket.emit("join-meeting", { meetingId, user: storedUser });
-      };
-
-      // Start the check
-      waitForStreamAndRejoin();
+      // Small delay to ensure state updates
+      setTimeout(() => {
+        socket.emit("i-am-ready", { meetingId, user: storedUser });
+      }, 500);
     });
 
     // Admission denied

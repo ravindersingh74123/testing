@@ -1,6 +1,3 @@
-
-// server/src/socket.js
-// server/src/socket.js
 const { Server } = require("socket.io");
 const Meeting = require("./models/Meeting");
 const ChatMessage = require("./models/ChatMessage");
@@ -326,6 +323,7 @@ module.exports = (server) => {
         user: userData.user,
       });
 
+      // ALSO broadcast user-joined for good measure
       socket.to(meetingId).emit("user-joined", {
         socketId: socket.id,
         user: userData.user,
@@ -333,9 +331,7 @@ module.exports = (server) => {
         isAdmin: userData.isAdmin || false,
       });
 
-      console.log(
-        "✅ [NOTIFY] Broadcasted peer-ready and user-joined to meeting"
-      );
+      console.log("✅ [NOTIFY] Broadcasted peer-ready and user-joined\n");
     });
 
     // Admin admits user
@@ -364,21 +360,53 @@ module.exports = (server) => {
 
           if (room && room.has(socketId)) {
             room.get(socketId).status = "admitted";
+            room.get(socketId).permissions = participant.permissions;
             admitted.add(socketId);
 
             console.log(
               `✅ [ADMIT] User admitted, notifying socket ${socketId}`
             );
+
+            // Send admission granted to user
             io.to(socketId).emit("admission-granted", {
               permissions: participant.permissions,
               settings: meeting.settings,
             });
 
-            // FIX: Broadcast to entire room that user was admitted
+            // Send chat history to newly admitted user
+            const messages = await ChatMessage.find({ meetingId }).sort({
+              timestamp: 1,
+            });
+            io.to(socketId).emit("chat-history", messages);
+
+            // Get OTHER admitted participants to send to newly admitted user
+            const otherAdmitted = Array.from(room.values()).filter(
+              (p) => admitted.has(p.socketId) && p.socketId !== socketId
+            );
+
+            console.log(
+              `👥 [ADMIT] Sending ${otherAdmitted.length} participants to admitted user`
+            );
+            io.to(socketId).emit("meeting-participants", otherAdmitted);
+
+            // Notify ALL other participants (including admin) about the new user
+            console.log(`📢 [ADMIT] Broadcasting user-joined to meeting`);
+            const userData = room.get(socketId);
+
+            socket.to(meetingId).emit("user-joined", {
+              socketId: socketId,
+              user: userData.user,
+              permissions: participant.permissions,
+              isAdmin: false,
+            });
+
+            // Also broadcast user-admitted event
             io.to(meetingId).emit("user-admitted", {
               userId,
               socketId,
             });
+
+            console.log(`✅ [ADMIT-COMPLETE] Admission complete\n`);
           }
         }
       } catch (err) {
