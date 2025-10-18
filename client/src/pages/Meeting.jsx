@@ -1,4 +1,26 @@
 // client/src/pages/Meeting.jsx
+/**
+ * Meeting.jsx
+ *
+ * Full, robust meeting component with:
+ * - Local media management
+ * - Socket connection lifecycle and event handlers
+ * - Waiting room + admission handling (no refresh required)
+ * - Glare-avoiding offer strategy: only the joiner creates offers after 'meeting-participants'
+ * - Pending-offer queue for streams not yet ready
+ * - Peer connection management with proper cleanup
+ * - Screen sharing, controls, admin functions
+ * - Chat panel with optimistic local send + deduplication of echoed messages
+ *
+ * Usage:
+ *  - Ensure server-side socket implements: join-meeting, meeting-participants, admission-request (admin-only),
+ *    admission-granted, admission-denied, webrtc-offer/answer, ice-candidate, chat-history, chat-message, request-participants
+ *
+ * Important:
+ *  - This file intentionally contains defensive checks, logs, and stable cleanup.
+ *  - If you use ESLint you may want to adjust rules for some long useEffect dependency lists.
+ */
+
 import React, { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { socket } from "../services/socket";
@@ -9,30 +31,60 @@ import TopBar from "../components/TopBar";
 import AdminPanel from "../components/AdminPanel";
 import WaitingRoom, { AccessDenied } from "../components/WaitingRoomModal";
 
-const storedUser = JSON.parse(localStorage.getItem("user")) || null;
-
-if (storedUser && storedUser.id && !storedUser._id) {
-  storedUser._id = storedUser.id;
-}
+// -----------------------------------------------------------------------------
+// Utilities & constants
+// -----------------------------------------------------------------------------
+const storedUser = (() => {
+  try {
+    const raw = localStorage.getItem("user");
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && parsed.id && !parsed._id) parsed._id = parsed.id;
+    return parsed;
+  } catch (e) {
+    console.warn("⚠️ [STORED-USER] Failed to parse localStorage user", e);
+    return null;
+  }
+})();
 
 const STUN_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
+function nowTs() {
+  return Date.now();
+}
+
+function makeChatKey({ message, user, timestamp }) {
+  // Creates a stable key to dedupe chat messages from server & local optimistic sends
+  // Use user id + message + rounded timestamp to avoid tiny timestamp differences
+  const uid = user?._id || user?.id || "unknown";
+  return `${uid}::${message}::${Math.round((timestamp || 0) / 1000)}`;
+}
+
+// -----------------------------------------------------------------------------
+// Main component
+// -----------------------------------------------------------------------------
 export default function Meeting() {
   const { id: meetingId } = useParams();
   const navigate = useNavigate();
 
+  // Refs and state
   const localVideoRef = useRef(null);
+  const pcsRef = useRef({}); // peer connections by remote socket id
+  const pendingOffersRef = useRef([]); // offers to create once local stream is ready
+  const socketConnectedRef = useRef(false);
+  const isJoiningRef = useRef(false);
+
+  const [localStream, setLocalStream] = useState(null);
+  const [peers, setPeers] = useState({}); // { [socketId]: { pc, stream, user } }
+  const [participants, setParticipants] = useState([]);
+  const [chatMessages, setChatMessages] = useState([]); // chat objects: { message, user, timestamp }
+  const chatKeyIndexRef = useRef(new Set()); // used to dedupe messages
 
   const [hasJoined, setHasJoined] = useState(false);
-  const [localStream, setLocalStream] = useState(null);
-  const [peers, setPeers] = useState({});
-  const pcsRef = useRef({}); // RTCPeerConnection objects mapped by remote socketId
-  const [participants, setParticipants] = useState([]);
-  const [chatMessages, setChatMessages] = useState([]);
   const [muted, setMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(false);
+
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [sidebarContent, setSidebarContent] = useState("admin");
+  const [sidebarContent, setSidebarContent] = useState("admin"); // admin/chat toggle
 
   const [isAdmin, setIsAdmin] = useState(false);
   const [userPermissions, setUserPermissions] = useState({
@@ -40,183 +92,193 @@ export default function Meeting() {
     canVideo: true,
     canScreenShare: true,
   });
-  const [waitingRoom, setWaitingRoom] = useState([]);
+
+  const [waitingRoom, setWaitingRoom] = useState([]); // for admin
   const [meetingSettings, setMeetingSettings] = useState({});
 
   const [inWaitingRoom, setInWaitingRoom] = useState(false);
   const [accessDenied, setAccessDenied] = useState(false);
 
-  // Refs for logic and queues
-  const pendingOffersRef = useRef([]); // [{ socketId, user }]
-  const socketConnectedRef = useRef(false);
-  const isJoiningRef = useRef(false);
+  // ---------------------------------------------------------------------------
+  // Logging helper
+  // ---------------------------------------------------------------------------
+  const LOG = {
+    d: (...args) => console.debug("🟦 [MEETING]", ...args),
+    i: (...args) => console.info("🟩 [MEETING]", ...args),
+    w: (...args) => console.warn("🟨 [MEETING]", ...args),
+    e: (...args) => console.error("🟥 [MEETING]", ...args),
+  };
 
-  console.log("🎬 [MEETING-RENDER] Meeting component rendered");
+  LOG.d("render", { meetingId, user: storedUser?.name });
 
-  // Sync sidebar when admin toggles
+  // ---------------------------------------------------------------------------
+  // Media setup - request camera/mic once on mount
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (isAdmin && sidebarContent === "chat") {
-      setSidebarContent("admin");
-    } else if (!isAdmin && sidebarContent === "admin") {
-      setSidebarContent("chat");
-    }
-  }, [isAdmin, sidebarContent]);
-
-  // GET LOCAL MEDIA
-  useEffect(() => {
-    console.log("📹 [MEDIA] Setting up local media");
+    LOG.i("📹 [MEDIA] initializing local media");
     let mounted = true;
+
     async function startLocal() {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video: true,
-        });
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
         if (!mounted) {
           stream.getTracks().forEach((t) => t.stop());
           return;
         }
-        console.log(
-          "✅ [MEDIA] Got local stream with tracks:",
-          stream.getTracks().map((t) => t.kind)
-        );
-
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-        }
         setLocalStream(stream);
-        console.log("✅ [MEDIA] Local stream set");
+        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+        LOG.i("✅ [MEDIA] local stream ready, tracks:", stream.getTracks().map((t) => t.kind));
       } catch (err) {
-        console.error("❌ [MEDIA-ERROR] Camera/Mic error:", err);
+        LOG.e("❌ [MEDIA-ERROR] getUserMedia failed", err);
         alert("Please allow camera and microphone access.");
       }
     }
+
     startLocal();
+
     return () => {
       mounted = false;
-      if (localStream) {
-        localStream.getTracks().forEach((t) => t.stop());
+      LOG.i("🧹 [MEDIA] cleanup - stopping local tracks");
+      try {
+        if (localStream) localStream.getTracks().forEach((t) => t.stop());
+      } catch (e) {
+        /* ignore */
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // only on mount
+  }, []); // run once
 
-  // KEEP hasJoined in a small effect so it can be set after meeting-joined
+  // ---------------------------------------------------------------------------
+  // Socket: all event handlers set up here; cleanup reliably removes all handlers
+  // Important: use named handler functions so off(...) works
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (hasJoined && socketConnectedRef.current) {
-      console.log("⚠️ [SKIP] Already joined this session");
-      return;
-    }
-  }, [hasJoined]);
-
-  //
-  // SOCKET CONNECTION & EVENTS (Complete robust setup)
-  //
-  useEffect(() => {
+    // Defensive pre-checks
     if (!meetingId || !storedUser) {
-      console.log("⚠️ [SOCKET] Missing meetingId or user, skipping socket setup");
+      LOG.w("⚠️ [SOCKET] missing meetingId or storedUser; skipping socket setup");
       return;
     }
-
     if (isJoiningRef.current) {
-      console.log("⚠️ [SOCKET] Already joining, skipping duplicate setup");
+      LOG.w("⚠️ [SOCKET] socket setup already in progress, skipping duplicate");
       return;
     }
     isJoiningRef.current = true;
-    console.log("\n🔌 [SOCKET] Setting up socket connection for meeting", meetingId);
+    LOG.i("🔌 [SOCKET] setting up socket for meeting", meetingId);
 
-    // Ensure socket connected (singleton)
-    if (!socket.connected) {
-      console.log("🔌 [SOCKET] Connecting socket");
-      socket.connect();
-    }
-
-    // Connect handler
+    // Keep a reference for the connect handler so we can remove it later
     const handleConnect = () => {
-      console.log("✅ [SOCKET-CONNECT] Socket connected, emitting join-meeting");
-      socket.emit("join-meeting", { meetingId, user: storedUser });
-      socketConnectedRef.current = true;
+      LOG.i("✅ [SOCKET-CONNECT] socket connected -> emit join-meeting");
+      try {
+        socket.emit("join-meeting", { meetingId, user: storedUser });
+        socketConnectedRef.current = true;
+      } catch (e) {
+        LOG.e("❌ [SOCKET] emit join-meeting failed", e);
+      }
     };
 
-    if (socket.connected) {
-      handleConnect();
-    } else {
+    // If socket already connected, call immediately; otherwise wait for connect
+    if (!socket.connected) {
+      socket.connect();
       socket.on("connect", handleConnect);
+    } else {
+      handleConnect();
     }
 
-    // ---------- Handlers ----------
+    // -------------------------
+    // Handler: meeting-joined
+    // -------------------------
     const handleMeetingJoined = ({ isAdmin: adminStatus, permissions, settings }) => {
-      console.log("🎉 [MEETING-JOINED] Received meeting-joined event");
-      console.log("   Admin:", adminStatus);
-      console.log("   Permissions:", permissions);
-      console.log("   Settings:", settings);
-
-      setIsAdmin(adminStatus);
-      setUserPermissions(permissions || userPermissions);
-      setMeetingSettings(settings || {});
+      LOG.i("🎉 [MEETING-JOINED] received", { adminStatus, permissions, settings });
+      setIsAdmin(Boolean(adminStatus));
+      if (permissions) setUserPermissions(permissions);
+      if (settings) setMeetingSettings(settings);
       setInWaitingRoom(false);
       setHasJoined(true);
 
-      // Apply initial settings
+      // Apply settings (mute / disable video on entry)
       if (settings?.muteMicOnEntry && !adminStatus) {
-        console.log("🔇 [SETTINGS] Applying muteMicOnEntry");
         setMuted(true);
-        if (localStream) {
-          localStream.getAudioTracks().forEach((t) => (t.enabled = false));
-        }
+        if (localStream) localStream.getAudioTracks().forEach((t) => (t.enabled = false));
       }
       if (settings?.disableVideoOnEntry && !adminStatus) {
-        console.log("📹 [SETTINGS] Applying disableVideoOnEntry");
         setCameraOff(true);
-        if (localStream) {
-          localStream.getVideoTracks().forEach((t) => (t.enabled = false));
-        }
+        if (localStream) localStream.getVideoTracks().forEach((t) => (t.enabled = false));
       }
 
-      // Process pending offers now (if any)
-      if (pendingOffersRef.current.length > 0) {
+      // Defensive: in case the server didn't send participants yet, process any pending offers
+      if (pendingOffersRef.current.length > 0 && localStream && localStream.active) {
         const pending = pendingOffersRef.current.splice(0);
-        console.log(`🔗 [PENDING-OFFERS] Creating ${pending.length} pending offers`);
-        pending.forEach(({ socketId, user }) => {
-          // Slight delay to allow localStream to stabilize
-          setTimeout(() => createOfferTo(socketId, user), 250);
-        });
+        LOG.i(`🔗 [PENDING-OFFERS] processing ${pending.length} offers after meeting-joined`);
+        pending.forEach(({ socketId, user }, i) => setTimeout(() => createOfferTo(socketId, user), i * 200));
       }
     };
     socket.on("meeting-joined", handleMeetingJoined);
 
+    // -------------------------
+    // Handler: waiting-room
+    // -------------------------
     const handleWaitingRoom = () => {
-      console.log("⏳ [WAITING-ROOM] Placed in waiting room");
+      LOG.i("⏳ [WAITING-ROOM] we are in waiting room");
       setInWaitingRoom(true);
     };
     socket.on("waiting-room", handleWaitingRoom);
 
+    // -------------------------
+    // Handler: admission-granted (admin admitted user)
+    // -------------------------
     const handleAdmissionGranted = ({ permissions, settings }) => {
-      console.log("✅ [ADMISSION-GRANTED] Admission granted");
+      LOG.i("✅ [ADMISSION-GRANTED] received", { permissions, settings });
       setInWaitingRoom(false);
-      setUserPermissions(permissions || userPermissions);
-      setMeetingSettings(settings || meetingSettings);
+      if (permissions) setUserPermissions(permissions);
+      if (settings) setMeetingSettings(settings);
+
+      // mark joined, and ask for participants as a fallback
+      setHasJoined(true);
+      try {
+        socket.emit("request-participants", { meetingId });
+      } catch (e) {
+        LOG.w("⚠️ [ADMISSION] request-participants emit failed", e);
+      }
+
+      // If pending offers exist, create them now (if local stream ready)
+      if (pendingOffersRef.current.length > 0 && localStream && localStream.active) {
+        const pending = pendingOffersRef.current.splice(0);
+        LOG.i(`🔗 [PENDING-OFFERS] processing ${pending.length} offers after admission-granted`);
+        pending.forEach(({ socketId, user }, i) => setTimeout(() => createOfferTo(socketId, user), i * 200));
+      }
     };
     socket.on("admission-granted", handleAdmissionGranted);
 
+    // -------------------------
+    // Handler: admission-denied
+    // -------------------------
     const handleAdmissionDenied = () => {
-      console.log("🚫 [ADMISSION-DENIED] Access denied");
+      LOG.i("🚫 [ADMISSION-DENIED] the host denied admission");
       setInWaitingRoom(false);
       setAccessDenied(true);
     };
     socket.on("admission-denied", handleAdmissionDenied);
 
+    // -------------------------
+    // Handler: join-error
+    // -------------------------
     const handleJoinError = ({ message }) => {
-      console.error("❌ [JOIN-ERROR]", message);
-      alert(message);
+      LOG.e("❌ [JOIN-ERROR]", message);
+      alert(message || "Failed to join meeting");
       navigate("/");
     };
     socket.on("join-error", handleJoinError);
 
+    // -------------------------
+    // Handler: admission-request (admin-only)
+    // -------------------------
+    // The server now only emits admission-request to admin sockets.
+    // But clients must dedupe duplicate events (safety).
     const handleAdmissionRequest = (requestData) => {
-      console.log("📨 [ADMISSION-REQUEST] Received admission request:", requestData);
+      LOG.i("📨 [ADMISSION-REQUEST] received", requestData);
       setWaitingRoom((prev) => {
         if (prev.some((u) => u.socketId === requestData.socketId)) {
+          LOG.d("   => duplicate admission-request ignored");
           return prev;
         }
         return [...prev, requestData];
@@ -224,214 +286,212 @@ export default function Meeting() {
     };
     socket.on("admission-request", handleAdmissionRequest);
 
+    // -------------------------
+    // Handler: user-admitted (admin notified to remove waiting list)
+    // -------------------------
     const handleUserAdmitted = ({ userId, socketId }) => {
-      console.log("✅ [USER-ADMITTED] User was admitted:", userId);
+      LOG.i("✅ [USER-ADMITTED] removing from waitingRoom", socketId);
       setWaitingRoom((prev) => prev.filter((u) => u.socketId !== socketId));
     };
     socket.on("user-admitted", handleUserAdmitted);
 
+    // -------------------------
+    // Handler: permissions-updated
+    // -------------------------
     const handlePermissionsUpdated = (permissions) => {
-      console.log("🔐 [PERMISSIONS-UPDATED] Permissions updated:", permissions);
-      setUserPermissions(permissions);
+      LOG.i("🔐 [PERMISSIONS-UPDATED]", permissions);
+      setUserPermissions((prev) => ({ ...prev, ...(permissions || {}) }));
 
       // Enforce permissions client-side
-      if (!permissions.canUnmute && localStream) {
-        console.log("🔇 [ENFORCE] Disabling audio tracks");
+      if (!permissions?.canUnmute && localStream) {
         localStream.getAudioTracks().forEach((t) => (t.enabled = false));
         setMuted(true);
       }
-      if (!permissions.canVideo && localStream) {
-        console.log("📹 [ENFORCE] Disabling video tracks");
+      if (!permissions?.canVideo && localStream) {
         localStream.getVideoTracks().forEach((t) => (t.enabled = false));
         setCameraOff(true);
       }
     };
     socket.on("permissions-updated", handlePermissionsUpdated);
 
+    // -------------------------
+    // Handler: removed-by-admin
+    // -------------------------
     const handleRemovedByAdmin = () => {
-      console.log("🚫 [REMOVED] Removed from meeting by admin");
+      LOG.i("🚫 [REMOVED-BY-ADMIN] you were removed");
       alert("You have been removed from the meeting by the host.");
       navigate("/");
     };
     socket.on("removed-by-admin", handleRemovedByAdmin);
 
+    // -------------------------
+    // Screen share events
+    // -------------------------
     const handleScreenShareGranted = () => {
-      console.log("✅ [SCREEN-SHARE] Permission granted");
+      LOG.i("✅ [SCREEN-SHARE-GRANTED] starting screen share");
       startScreenShare();
     };
     socket.on("screen-share-granted", handleScreenShareGranted);
 
     const handleScreenShareDenied = () => {
-      console.log("🚫 [SCREEN-SHARE] Permission denied");
+      LOG.i("🚫 [SCREEN-SHARE-DENIED] host denied screen share");
       alert("Screen share permission denied. Please ask the host for permission.");
     };
     socket.on("screen-share-denied", handleScreenShareDenied);
 
     const handleScreenShareRequest = ({ userId, name, socketId }) => {
-      console.log("📨 [SCREEN-SHARE-REQUEST] Request from:", name);
+      LOG.i("📨 [SCREEN-SHARE-REQUEST] request from", name, socketId);
     };
     socket.on("screen-share-request", handleScreenShareRequest);
 
+    // -------------------------
+    // Chat: history + messages
+    // -------------------------
     const handleChatHistory = (messages) => {
-      console.log(`💬 [CHAT-HISTORY] Received ${messages.length} messages`);
-      setChatMessages(messages || []);
+      LOG.i(`💬 [CHAT-HISTORY] Received ${messages?.length || 0} messages`);
+      // Build dedupe index
+      const idx = new Set();
+      const sanitized = (messages || []).map((m) => {
+        const item = { message: m.message, user: m.user, timestamp: m.timestamp || nowTs() };
+        idx.add(makeChatKey(item));
+        return item;
+      });
+      chatKeyIndexRef.current = idx;
+      setChatMessages(sanitized);
     };
     socket.on("chat-history", handleChatHistory);
 
     const handleChatMessage = ({ message, user, timestamp }) => {
-      console.log(`💬 [CHAT-MESSAGE] New message from ${user?.name}`);
-      setChatMessages((prev) => {
-        const lastMsg = prev[prev.length - 1];
-        if (lastMsg && lastMsg.message === message && lastMsg.user._id === user._id) {
-          console.log("   Duplicate message, ignoring");
-          return prev;
-        }
-        return [...prev, { message, user, timestamp }];
-      });
+      const item = { message, user, timestamp: timestamp || nowTs() };
+      const key = makeChatKey(item);
+      // Deduplicate (prevents double-add when optimistic local send and server echo)
+      if (chatKeyIndexRef.current.has(key)) {
+        LOG.d("💬 [CHAT] duplicate message ignored", key);
+        return;
+      }
+      chatKeyIndexRef.current.add(key);
+      setChatMessages((prev) => [...prev, item]);
+      LOG.d("💬 [CHAT] appended", item);
     };
     socket.on("chat-message", handleChatMessage);
 
-    // meeting-participants: this event is sent to the joiner and contains current participants
-    const handleParticipants = (list) => {
-      console.log(`👥 [MEETING-PARTICIPANTS] Received ${list.length} participants`);
-      list.forEach((p) => {
-        console.log(`   - ${p.user?.name || "Unknown"} (${p.socketId})`);
-      });
+    // -------------------------
+    // Participants list: joiner receives list of currently admitted participants
+    // -------------------------
+    const handleMeetingParticipants = (list) => {
+      const arr = list || [];
+      LOG.i(`👥 [MEETING-PARTICIPANTS] Received ${arr.length} participants`);
+      setParticipants(arr);
 
-      setParticipants(list || []);
-
-      // If localStream ready, create offers to all other participants.
-      // Only the *joiner* should create offers — existing participants won't create offers on 'user-joined'
+      // Joiner (the one that received meeting-participants) should create offers to each participant.
       if (localStream && localStream.active && localStream.getTracks().length > 0) {
-        console.log("🔗 [OFFERS] Creating offers to current participants (joiner)");
-        list.forEach((p) => {
-          if (p.socketId === socket.id) return; // skip self
-          if (!pcsRef.current[p.socketId]) {
-            // slight stagger to avoid flooding
-            setTimeout(() => createOfferTo(p.socketId, p.user), 200);
-          }
+        arr.forEach((p, i) => {
+          if (p.socketId === socket.id) return;
+          // Stagger offers to reduce race
+          setTimeout(() => {
+            if (!pcsRef.current[p.socketId]) createOfferTo(p.socketId, p.user);
+          }, i * 200);
         });
       } else {
-        console.log("⏳ [PENDING-OFFERS] No local stream yet, queuing offers");
-        list.forEach((p) => {
+        // Queue them for later
+        arr.forEach((p) => {
           if (p.socketId === socket.id) return;
           pendingOffersRef.current.push({ socketId: p.socketId, user: p.user });
         });
       }
     };
-    socket.on("meeting-participants", handleParticipants);
+    socket.on("meeting-participants", handleMeetingParticipants);
 
-    // user-joined: notify participants a new user arrived - existing participants SHOULD NOT create offers (avoid glare)
+    // -------------------------
+    // Participant joined/left notifications (do NOT create offers here)
+    // -------------------------
     const handleUserJoined = ({ socketId, user, permissions, isAdmin: userIsAdmin }) => {
-      console.log(`\n👋 [USER-JOINED] ${user?.name} joined (${socketId})`);
-
-      // Add to participants state
-      setParticipants((prev) => {
-        if (prev.some((x) => x.socketId === socketId)) return prev;
-        return [...prev, { socketId, user, permissions, isAdmin: userIsAdmin }];
-      });
-
-      // IMPORTANT: Do NOT create offer here (existing participants). The joiner will create offers via meeting-participants.
-      // However, if you want fallback behavior (rare), you could queue a pendingOffer to be processed by the joiner.
+      LOG.i("👋 [USER-JOINED]", user?.name, socketId);
+      setParticipants((prev) => (prev.some((x) => x.socketId === socketId) ? prev : [...prev, { socketId, user, permissions, isAdmin: userIsAdmin }]));
+      // Do NOT create offer here — joiner will create offers
     };
     socket.on("user-joined", handleUserJoined);
 
-    // user-left
     const handleUserLeft = ({ socketId }) => {
-      console.log(`👋 [USER-LEFT] User left: ${socketId}`);
+      LOG.i("👋 [USER-LEFT]", socketId);
       setParticipants((prev) => prev.filter((p) => p.socketId !== socketId));
       setWaitingRoom((prev) => prev.filter((u) => u.socketId !== socketId));
-
       if (pcsRef.current[socketId]) {
-        console.log("🧹 [CLEANUP] Closing peer connection for", socketId);
-        try {
-          pcsRef.current[socketId].close();
-        } catch (e) {
-          /* ignore */
-        }
+        try { pcsRef.current[socketId].close(); } catch (e) {}
         delete pcsRef.current[socketId];
       }
-
       setPeers((prev) => {
-        const newPeers = { ...prev };
-        delete newPeers[socketId];
-        return newPeers;
+        const copy = { ...prev }; delete copy[socketId]; return copy;
       });
     };
     socket.on("user-left", handleUserLeft);
 
-    // --------------------
-    // WebRTC signaling handlers
-    // --------------------
-
-    // OFFER -> we are answering
+    // -------------------------
+    // WebRTC signaling handlers (relay flows)
+    // -------------------------
+    // We are answering when we receive an offer
     const handleWebrtcOffer = async ({ from, sdp, fromUser }) => {
-      console.log(`\n📨 [WEBRTC-OFFER] Received offer from ${from}`);
+      LOG.i("📨 [WEBRTC-OFFER] from", from);
+      // Clear stale pc if exists
+      if (pcsRef.current[from]) {
+        try { pcsRef.current[from].close(); } catch (e) {}
+        delete pcsRef.current[from];
+      }
       try {
-        // Close stale PC if any
-        if (pcsRef.current[from]) {
-          console.log("🔄 [OFFER] Closing existing connection (stale) for", from);
-          try { pcsRef.current[from].close(); } catch (e) {}
-          delete pcsRef.current[from];
-        }
         const pc = createPeerConnection(from, fromUser);
         pcsRef.current[from] = pc;
-
         await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-        console.log("✅ [OFFER] Remote description set for", from);
-
+        LOG.d("✅ [OFFER] set remote desc for", from);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        console.log("✅ [ANSWER] Created and set local description for", from);
-
+        LOG.d("✅ [ANSWER] created and set local desc for", from);
         socket.emit("webrtc-answer", { to: from, sdp: pc.localDescription });
-        console.log("📤 [ANSWER] Sent answer to", from);
+        LOG.d("📤 [ANSWER] sent to", from);
       } catch (err) {
-        console.error("❌ [OFFER-ERROR]", err);
+        LOG.e("❌ [OFFER-ERROR]", err);
       }
     };
     socket.on("webrtc-offer", handleWebrtcOffer);
 
-    // ANSWER -> we initiated offer earlier
+    // We initiated offer earlier and now receive an answer
     const handleWebrtcAnswer = async ({ from, sdp }) => {
-      console.log(`📨 [WEBRTC-ANSWER] Received answer from ${from}`);
+      LOG.i("📨 [WEBRTC-ANSWER] from", from);
       const pc = pcsRef.current[from];
       if (!pc) {
-        console.log("⚠️ [WEBRTC] No PC found for answer from", from);
+        LOG.w("⚠️ [WEBRTC-ANSWER] No PC for", from);
         return;
       }
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-        console.log("🔗 [WEBRTC] Remote description set (answer) for", from);
+        LOG.d("🔗 [WEBRTC] remoteDescription set (answer) for", from);
       } catch (err) {
-        console.error("❌ [WEBRTC-ANSWER-ERROR]", err);
+        LOG.e("❌ [WEBRTC-ANSWER-ERROR]", err);
       }
     };
     socket.on("webrtc-answer", handleWebrtcAnswer);
 
-    // ICE candidates
+    // ICE candidate
     const handleIceCandidate = async ({ from, candidate }) => {
       const pc = pcsRef.current[from];
       if (!pc) {
-        console.log("⚠️ [ICE] No PC found for candidate from", from);
+        LOG.w("⚠️ [ICE] No PC for candidate from", from);
         return;
       }
       try {
         await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        // console.log("🧊 [ICE] Candidate added for", from);
-      } catch (e) {
-        console.error("❌ [ICE-ERROR]", e);
+      } catch (err) {
+        LOG.e("❌ [ICE-ERROR]", err);
       }
     };
     socket.on("ice-candidate", handleIceCandidate);
 
-    // --------------------
-    // End of handlers
-    // --------------------
-
-    // CLEANUP: remove listeners and close PCs on unmount or meetingId change
+    // -------------------------
+    // Cleanup: remove handlers and close peer connections on unmount or meetingId change
+    // -------------------------
     return () => {
-      console.log("\n🧹 [SOCKET-CLEANUP] Cleaning up socket listeners");
+      LOG.i("🧹 [SOCKET-CLEANUP] removing handlers and cleaning up peers");
+
+      // Remove handlers
       try {
         socket.off("connect", handleConnect);
         socket.off("meeting-joined", handleMeetingJoined);
@@ -448,87 +508,68 @@ export default function Meeting() {
         socket.off("screen-share-request", handleScreenShareRequest);
         socket.off("chat-history", handleChatHistory);
         socket.off("chat-message", handleChatMessage);
-        socket.off("meeting-participants", handleParticipants);
+        socket.off("meeting-participants", handleMeetingParticipants);
         socket.off("user-joined", handleUserJoined);
         socket.off("user-left", handleUserLeft);
         socket.off("webrtc-offer", handleWebrtcOffer);
         socket.off("webrtc-answer", handleWebrtcAnswer);
         socket.off("ice-candidate", handleIceCandidate);
       } catch (e) {
-        console.warn("⚠️ [SOCKET-CLEANUP] Error removing listeners", e);
+        LOG.w("⚠️ [SOCKET-CLEANUP] error removing handlers", e);
       }
 
       // Close all peer connections
-      console.log("🧹 [CLEANUP] Closing all peer connections");
       Object.values(pcsRef.current).forEach((pc) => {
-        try {
-          pc.close();
-        } catch (e) {}
+        try { pc.close(); } catch (e) {}
       });
       pcsRef.current = {};
       pendingOffersRef.current = [];
       socketConnectedRef.current = false;
       isJoiningRef.current = false;
-
-      // If you want to fully disconnect the socket when leaving meeting, you can do:
-      try {
-        socket.disconnect();
-      } catch (e) {
-        /* ignore */
-      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meetingId, localStream, navigate]);
+  }, [meetingId, localStream, navigate]); // localStream used so we can process pending offers earlier
 
-  //
-  // Process pending offers once local stream becomes available/stable
-  //
+  // ---------------------------------------------------------------------------
+  // When localStream is ready, flush pendingOffersRef
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (!localStream || !localStream.active || localStream.getTracks().length === 0) {
-      return;
-    }
+    if (!localStream || !localStream.active || localStream.getTracks().length === 0) return;
 
     const pending = pendingOffersRef.current.splice(0);
     if (pending.length > 0) {
-      console.log(`🔗 [PENDING-OFFERS] Processing ${pending.length} pending offers`);
-      pending.forEach(({ socketId, user }, i) => {
-        setTimeout(() => createOfferTo(socketId, user), i * 200);
-      });
+      LOG.i(`🔗 [PENDING-OFFERS] flushing ${pending.length} pending offers`);
+      pending.forEach(({ socketId, user }, i) => setTimeout(() => createOfferTo(socketId, user), i * 200));
     }
   }, [localStream]);
 
-  //
-  // CREATE PEER CONNECTION
-  //
+  // ---------------------------------------------------------------------------
+  // Peer creation and offer generation
+  // ---------------------------------------------------------------------------
   function createPeerConnection(remoteSocketId, remoteUser = null) {
-    console.log(`🔗 [CREATE-PC] Creating peer connection for ${remoteSocketId}`);
-
+    LOG.d("🔗 [CREATE-PC] for", remoteSocketId);
     const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
-
-    // Create a remote MediaStream and attach tracks as they arrive
     const remoteStream = new MediaStream();
 
-    // If local stream exists, add local tracks to the pc
+    // Add local tracks if present
     if (localStream && localStream.active) {
-      const tracks = localStream.getTracks();
-      console.log(`📤 [PC] Adding ${tracks.length} local tracks to PC for ${remoteSocketId}`);
-      tracks.forEach((t) => {
+      localStream.getTracks().forEach((t) => {
         try {
           pc.addTrack(t, localStream);
         } catch (e) {
-          console.warn("⚠️ [PC-ADD-TRACK] Could not add track", e);
+          LOG.w("⚠️ [PC-ADD-TRACK] failed for", t.kind, e);
         }
       });
     }
 
-    // ontrack: add remote track to remoteStream immediately (no onunmute wait)
+    // ontrack: add track to remote stream immediately
     pc.ontrack = (ev) => {
-      console.log(`📥 [PC-TRACK] Received ${ev.track.kind} track from ${remoteSocketId}`);
+      LOG.d(`📥 [PC-TRACK] from ${remoteSocketId}: ${ev.track.kind}`);
       if (!remoteStream.getTrackById(ev.track.id)) {
         remoteStream.addTrack(ev.track);
-        console.log(`✅ [STREAM] Added ${ev.track.kind} track to remote stream for ${remoteSocketId}`);
+        LOG.d(`✅ [STREAM] added ${ev.track.kind} track for ${remoteSocketId}`);
 
-        // Update peers state to include stream & user
+        // Update peers state
         setPeers((prev) => ({
           ...prev,
           [remoteSocketId]: {
@@ -540,25 +581,24 @@ export default function Meeting() {
       }
     };
 
-    // ICE candidate: send to remote peer
+    // ICE candidates to server
     pc.onicecandidate = (e) => {
       if (e.candidate) {
-        socket.emit("ice-candidate", { to: remoteSocketId, candidate: e.candidate });
+        try {
+          socket.emit("ice-candidate", { to: remoteSocketId, candidate: e.candidate });
+        } catch (err) {
+          LOG.w("⚠️ [ICE] emit failed", err);
+        }
       }
     };
 
     pc.onconnectionstatechange = () => {
-      console.log(`🔌 [PC-STATE] ${remoteSocketId}: ${pc.connectionState}`);
-      if (pc.connectionState === "connected") {
-        console.log(`✅ [CONNECTED] ${remoteSocketId} connected`);
-      }
+      LOG.d(`🔌 [PC-STATE] ${remoteSocketId}: ${pc.connectionState}`);
+      if (pc.connectionState === "connected") LOG.i(`✅ [CONNECTED] ${remoteSocketId}`);
       if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
-        console.log(`🧹 [PC-CLEANUP] Connection state ${pc.connectionState} for ${remoteSocketId}`);
-        // cleanup
+        LOG.i(`🧹 [PC-CLEANUP] ${remoteSocketId} state ${pc.connectionState}`);
         setPeers((prev) => {
-          const updated = { ...prev };
-          delete updated[remoteSocketId];
-          return updated;
+          const copy = { ...prev }; delete copy[remoteSocketId]; return copy;
         });
         if (pcsRef.current[remoteSocketId]) {
           try { pcsRef.current[remoteSocketId].close(); } catch (e) {}
@@ -568,10 +608,10 @@ export default function Meeting() {
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log(`🧊 [ICE-STATE] ${remoteSocketId}: ${pc.iceConnectionState}`);
+      LOG.d(`🧊 [ICE-STATE] ${remoteSocketId}: ${pc.iceConnectionState}`);
     };
 
-    // Initialize peer entry immediately so UI can render placeholder
+    // Initialize peers entry so UI shows placeholder immediately
     setPeers((prev) => ({
       ...prev,
       [remoteSocketId]: {
@@ -584,20 +624,17 @@ export default function Meeting() {
     return pc;
   }
 
-  //
-  // CREATE OFFER (used by joiner when receiving meeting-participants)
-  //
   async function createOfferTo(remoteSocketId, remoteUser = null) {
-    console.log(`📞 [OFFER] Creating offer to ${remoteSocketId}`);
+    LOG.i("📞 [OFFER] creating offer to", remoteSocketId);
 
-    // If we already have a PC, assume connection is in progress or connected — skip creating another offer
+    // If PC exists and is active, skip
     if (pcsRef.current[remoteSocketId]) {
       const existing = pcsRef.current[remoteSocketId];
       if (existing.connectionState === "connected" || existing.connectionState === "connecting") {
-        console.log("✅ [OFFER] Connection already exists/connecting, skipping", remoteSocketId);
+        LOG.d("✅ [OFFER] existing pc active/connecting, skipping", remoteSocketId);
         return;
       } else {
-        console.log("🔄 [OFFER] Closing stale existing PC for", remoteSocketId);
+        LOG.d("🔄 [OFFER] closing stale pc for", remoteSocketId);
         try { existing.close(); } catch (e) {}
         delete pcsRef.current[remoteSocketId];
       }
@@ -605,7 +642,7 @@ export default function Meeting() {
 
     // Ensure local stream is ready
     if (!localStream || !localStream.active || localStream.getTracks().length === 0) {
-      console.error("❌ [OFFER] Local stream not ready, queueing offer for", remoteSocketId);
+      LOG.w("⏳ [OFFER] local stream not ready, queueing offer", remoteSocketId);
       pendingOffersRef.current.push({ socketId: remoteSocketId, user: remoteUser });
       return;
     }
@@ -614,45 +651,37 @@ export default function Meeting() {
     pcsRef.current[remoteSocketId] = pc;
 
     try {
-      // Create offer
       const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
       await pc.setLocalDescription(offer);
-
-      console.log("📤 [OFFER] Sending offer to", remoteSocketId);
-      socket.emit("webrtc-offer", {
-        to: remoteSocketId,
-        sdp: pc.localDescription,
-        fromUser: storedUser,
-      });
+      LOG.d("📤 [OFFER] sending offer to", remoteSocketId);
+      socket.emit("webrtc-offer", { to: remoteSocketId, sdp: pc.localDescription, fromUser: storedUser });
     } catch (err) {
-      console.error("❌ [OFFER-ERROR]", err);
+      LOG.e("❌ [OFFER-ERROR]", err);
       if (pcsRef.current[remoteSocketId]) {
         try { pcsRef.current[remoteSocketId].close(); } catch (e) {}
         delete pcsRef.current[remoteSocketId];
       }
       setPeers((prev) => {
-        const newPeers = { ...prev };
-        delete newPeers[remoteSocketId];
-        return newPeers;
+        const copy = { ...prev }; delete copy[remoteSocketId]; return copy;
       });
     }
   }
 
-  //
-  // Controls & Utilities
-  //
+  // ---------------------------------------------------------------------------
+  // Controls: mute/camera toggles, screen share
+  // ---------------------------------------------------------------------------
   function toggleMute() {
     if (!localStream) return;
     if (!userPermissions.canUnmute && muted) {
       alert("You don't have permission to unmute. Please ask the host.");
       return;
     }
-
-    const tracks = localStream.getAudioTracks();
-    tracks.forEach((t) => (t.enabled = !t.enabled));
-    const newMuted = tracks.length ? !tracks[0].enabled : false;
-    console.log(`🎤 [CONTROLS] Mic ${newMuted ? "muted" : "unmuted"}`);
-    setMuted(newMuted);
+    const audios = localStream.getAudioTracks();
+    if (audios.length === 0) return;
+    const newEnabled = !audios[0].enabled;
+    audios.forEach((t) => (t.enabled = newEnabled));
+    setMuted(!newEnabled);
+    LOG.i(`🎤 [CONTROLS] mic ${!newEnabled ? "muted" : "unmuted"}`);
   }
 
   function toggleCamera() {
@@ -661,17 +690,58 @@ export default function Meeting() {
       alert("You don't have permission to enable video. Please ask the host.");
       return;
     }
+    const vids = localStream.getVideoTracks();
+    if (vids.length === 0) return;
+    const newEnabled = !vids[0].enabled;
+    vids.forEach((t) => (t.enabled = newEnabled));
+    setCameraOff(!newEnabled);
+    LOG.i(`📹 [CONTROLS] camera ${!newEnabled ? "off" : "on"}`);
+  }
 
-    const tracks = localStream.getVideoTracks();
-    tracks.forEach((t) => (t.enabled = !t.enabled));
-    const newCameraOff = tracks.length ? !tracks[0].enabled : false;
-    console.log(`📹 [CONTROLS] Camera ${newCameraOff ? "off" : "on"}`);
-    setCameraOff(newCameraOff);
+  async function startScreenShare() {
+    LOG.i("🖥️ [SCREEN-SHARE] starting");
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      alert("Screen sharing is not supported on this browser.");
+      return;
+    }
+    try {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const screenTrack = screenStream.getVideoTracks()[0];
+      // Replace video sender in all peer connections
+      Object.values(pcsRef.current).forEach((pc) => {
+        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+        if (sender) {
+          try {
+            sender.replaceTrack(screenTrack);
+          } catch (e) {
+            LOG.w("⚠️ [SCREEN-SHARE] replaceTrack failed", e);
+          }
+        }
+      });
+
+      screenTrack.onended = () => {
+        LOG.i("🛑 [SCREEN-SHARE] ended - restoring camera");
+        if (!localStream) return;
+        const camTrack = localStream.getVideoTracks()[0];
+        Object.values(pcsRef.current).forEach((pc) => {
+          const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+          if (sender && camTrack) {
+            try {
+              sender.replaceTrack(camTrack);
+            } catch (e) {
+              LOG.w("⚠️ [SCREEN-SHARE] replace back failed", e);
+            }
+          }
+        });
+      };
+    } catch (err) {
+      LOG.e("❌ [SCREEN-SHARE-ERROR]", err);
+    }
   }
 
   async function handleScreenShare() {
     if (!userPermissions.canScreenShare && !isAdmin) {
-      console.log("📨 [SCREEN-SHARE] Requesting permission");
+      LOG.i("📨 [SCREEN-SHARE] requesting permission");
       socket.emit("request-screen-share", { meetingId });
       alert("Screen share request sent to the host.");
       return;
@@ -679,165 +749,130 @@ export default function Meeting() {
     startScreenShare();
   }
 
-  async function startScreenShare() {
-    console.log("🖥️ [SCREEN-SHARE] Starting screen share");
-    if (!navigator.mediaDevices.getDisplayMedia)
-      return alert("Screen sharing not supported.");
-
-    try {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-      const screenTrack = screenStream.getVideoTracks()[0];
-
-      console.log("🔄 [SCREEN-SHARE] Replacing video tracks in all peer connections");
-      Object.values(pcsRef.current).forEach((pc) => {
-        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-        if (sender) {
-          sender.replaceTrack(screenTrack).catch((e) => console.warn("⚠️ [REPLACE-TRACK] ", e));
-        }
-      });
-
-      screenTrack.onended = () => {
-        console.log("🛑 [SCREEN-SHARE] Screen share ended, restoring camera");
-        if (!localStream) return;
-        const camTrack = localStream.getVideoTracks()[0];
-        Object.values(pcsRef.current).forEach((pc) => {
-          const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-          if (sender && camTrack) {
-            sender.replaceTrack(camTrack).catch((e) => console.warn("⚠️ [REPLACE-BACK] ", e));
-          }
-        });
-      };
-    } catch (err) {
-      console.error("❌ [SCREEN-SHARE-ERROR]", err);
-    }
-  }
-
-  // SEND CHAT
+  // ---------------------------------------------------------------------------
+  // Chat: optimistic send & dedupe
+  // ---------------------------------------------------------------------------
   async function sendChat(message) {
-    if (!message?.trim()) return;
-    const user = storedUser;
-    if (!user) return alert("User not logged in");
+    if (!message || !message.trim()) return;
+    if (!storedUser) return alert("User not logged in");
+    const userId = storedUser._id || storedUser.id;
+    if (!userId) return alert("Error: User ID is missing. Please log in again.");
 
-    const userId = user._id || user.id;
-    if (!userId) {
-      console.error("❌ [CHAT] User object is missing id:", user);
-      alert("Error: User ID is missing. Please log in again.");
-      return;
+    // Build local optimistic message
+    const timestamp = nowTs();
+    const msgObj = { message: message.trim(), user: { _id: userId, name: storedUser.name }, timestamp };
+    const key = makeChatKey(msgObj);
+
+    // Add locally (optimistic)
+    if (!chatKeyIndexRef.current.has(key)) {
+      chatKeyIndexRef.current.add(key);
+      setChatMessages((prev) => [...prev, msgObj]);
+    } else {
+      LOG.d("💬 [CHAT] optimistic duplicate prevented");
     }
 
-    console.log(`💬 [CHAT-SEND] Sending message: "${message}"`);
-    socket.emit("chat-message", {
-      meetingId,
-      message,
-      user: {
-        name: user.name,
-        _id: userId,
-      },
-    });
+    // Emit to server
+    try {
+      socket.emit("chat-message", { meetingId, message: msgObj.message, user: msgObj.user });
+      // server will broadcast and handle persistence; our dedupe prevents duplication
+    } catch (err) {
+      LOG.e("❌ [CHAT] emit failed", err);
+      alert("Failed to send message (network error).");
+    }
   }
 
-  // ADMIN FUNCTIONS
+  // ---------------------------------------------------------------------------
+  // Admin actions
+  // ---------------------------------------------------------------------------
   function handleAdmitUser(userId, socketId) {
-    console.log(`👮 [ADMIN-ADMIT] Admitting user ${userId} (${socketId})`);
+    LOG.i("👮 [ADMIN-ADMIT] ", userId, socketId);
     socket.emit("admit-user", { meetingId, userId, socketId });
+    // optimistic UI: remove from waitingRoom immediately
     setWaitingRoom((prev) => prev.filter((u) => u.socketId !== socketId));
   }
 
   function handleDenyUser(userId, socketId) {
-    console.log(`👮 [ADMIN-DENY] Denying user ${userId} (${socketId})`);
+    LOG.i("👮 [ADMIN-DENY] ", userId, socketId);
     socket.emit("deny-user", { meetingId, userId, socketId });
     setWaitingRoom((prev) => prev.filter((u) => u.socketId !== socketId));
   }
 
   function handleUpdatePermissions(userId, permissions) {
-    console.log(`👮 [ADMIN-PERMISSIONS] Updating permissions for ${userId}`, permissions);
+    LOG.i("👮 [ADMIN-PERMISSIONS] ", userId, permissions);
     socket.emit("update-permissions", { meetingId, userId, permissions });
-
-    setParticipants((prev) =>
-      prev.map((p) => {
-        const pUserId = p.user._id || p.user.id;
-        if (pUserId === userId) {
-          return { ...p, permissions };
-        }
-        return p;
-      })
-    );
+    // reflect updated permission in participants array
+    setParticipants((prev) => prev.map((p) => {
+      const pUserId = p.user._id || p.user.id;
+      if (pUserId === userId) return { ...p, permissions };
+      return p;
+    }));
   }
 
   function handleRemoveParticipant(userId) {
-    if (window.confirm("Are you sure you want to remove this participant?")) {
-      console.log(`👮 [ADMIN-REMOVE] Removing participant ${userId}`);
-      socket.emit("remove-participant", { meetingId, userId });
-    }
+    if (!window.confirm("Are you sure you want to remove this participant?")) return;
+    LOG.i("👮 [ADMIN-REMOVE] ", userId);
+    socket.emit("remove-participant", { meetingId, userId });
   }
 
   async function handleUpdateSettings(settings) {
-    console.log(`👮 [ADMIN-SETTINGS] Updating settings`, settings);
+    LOG.i("👮 [ADMIN-SETTINGS] updating", settings);
     try {
       const token = localStorage.getItem("token");
       const response = await fetch(`/api/admin/${meetingId}/settings`, {
         method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ settings }),
       });
-
       if (response.ok) {
         setMeetingSettings(settings);
-        console.log("✅ [ADMIN-SETTINGS] Settings updated successfully");
         alert("Settings updated successfully!");
       } else {
-        console.error("❌ [ADMIN-SETTINGS] Failed to update settings");
         alert("Failed to update settings");
       }
     } catch (err) {
-      console.error("❌ [ADMIN-SETTINGS-ERROR]", err);
+      LOG.e("❌ [ADMIN-SETTINGS-ERROR]", err);
       alert("Failed to update settings");
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Leave meeting: close tracks, pcs, and emit leave
+  // ---------------------------------------------------------------------------
   function handleLeave() {
-    console.log("👋 [LEAVE] Leaving meeting");
-    try {
-      socket.emit("leave-meeting", { meetingId });
-    } catch (e) {}
-    // Close local media
+    LOG.i("👋 [LEAVE] leaving meeting");
+    try { socket.emit("leave-meeting", { meetingId }); } catch (e) { LOG.w("⚠️ [LEAVE] emit failed", e); }
+
     try {
       if (localStream) localStream.getTracks().forEach((t) => t.stop());
-    } catch (e) {}
+    } catch (e) { /* ignore */ }
 
-    // Close peer connections
-    Object.values(pcsRef.current).forEach((pc) => {
-      try { pc.close(); } catch (e) {}
-    });
+    Object.values(pcsRef.current).forEach((pc) => { try { pc.close(); } catch (e) {} });
     pcsRef.current = {};
     setPeers({});
     navigate("/");
   }
 
-  // RENDER WAITING ROOM
+  // ---------------------------------------------------------------------------
+  // UI / render
+  // ---------------------------------------------------------------------------
   if (inWaitingRoom) {
     return <WaitingRoom userName={storedUser?.name} onCancel={() => navigate("/")} />;
   }
 
-  // RENDER ACCESS DENIED
   if (accessDenied) {
     return <AccessDenied onGoBack={() => navigate("/")} />;
   }
 
-  // RENDER MAIN MEETING (UI preserved from original)
   return (
     <div className="h-screen flex flex-col bg-gradient-to-br from-slate-900 via-gray-900 to-slate-800 text-white overflow-hidden">
+      {/* Top bar */}
       <div className="flex-shrink-0 border-b border-gray-700/50 backdrop-blur-sm bg-gray-900/80">
         <TopBar />
       </div>
 
+      {/* Main area */}
       <div className="flex-1 flex overflow-hidden relative">
-        <div
-          className={`flex-1 transition-all duration-500 ease-in-out ${sidebarOpen ? "lg:mr-96" : "mr-0"}`}
-        >
+        <div className={`flex-1 transition-all duration-500 ease-in-out ${sidebarOpen ? "lg:mr-96" : "mr-0"}`}>
           <div className="h-full w-full p-3 lg:p-4">
             <VideoGrid
               localVideoRef={localVideoRef}
@@ -851,28 +886,15 @@ export default function Meeting() {
           </div>
         </div>
 
-        <div
-          className={`fixed lg:absolute top-16 lg:top-0 right-0 h-[calc(100%-16rem)] lg:h-full w-full lg:w-96 bg-gradient-to-b from-gray-800 to-gray-900 border-l border-gray-700/50 shadow-2xl transform transition-transform duration-500 ease-in-out z-40 ${sidebarOpen ? "translate-x-0" : "translate-x-full"}`}
-        >
+        {/* Sidebar */}
+        <div className={`fixed lg:absolute top-16 lg:top-0 right-0 h-[calc(100%-16rem)] lg:h-full w-full lg:w-96 bg-gradient-to-b from-gray-800 to-gray-900 border-l border-gray-700/50 shadow-2xl transform transition-transform duration-500 ease-in-out z-40 ${sidebarOpen ? "translate-x-0" : "translate-x-full"}`}>
           <div className="h-full flex flex-col">
             {isAdmin && (
               <div key="admin-tabs" className="flex-shrink-0 flex border-b border-gray-700">
-                <button
-                  onClick={() => setSidebarContent("chat")}
-                  className={`flex-1 py-3 px-4 font-medium transition-colors ${sidebarContent === "chat" ? "bg-gray-700 text-white border-b-2 border-blue-500" : "text-gray-400 hover:bg-gray-800"}`}
-                >
-                  Chat
-                </button>
-                <button
-                  onClick={() => setSidebarContent("admin")}
-                  className={`flex-1 py-3 px-4 font-medium transition-colors relative ${sidebarContent === "admin" ? "bg-gray-700 text-white border-b-2 border-blue-500" : "text-gray-400 hover:bg-gray-800"}`}
-                >
+                <button onClick={() => setSidebarContent("chat")} className={`flex-1 py-3 px-4 font-medium transition-colors ${sidebarContent === "chat" ? "bg-gray-700 text-white border-b-2 border-blue-500" : "text-gray-400 hover:bg-gray-800"}`}>Chat</button>
+                <button onClick={() => setSidebarContent("admin")} className={`flex-1 py-3 px-4 font-medium transition-colors relative ${sidebarContent === "admin" ? "bg-gray-700 text-white border-b-2 border-blue-500" : "text-gray-400 hover:bg-gray-800"}`}>
                   Admin
-                  {waitingRoom.length > 0 && (
-                    <span className="absolute top-2 right-2 bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
-                      {waitingRoom.length}
-                    </span>
-                  )}
+                  {waitingRoom.length > 0 && <span className="absolute top-2 right-2 bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">{waitingRoom.length}</span>}
                 </button>
               </div>
             )}
@@ -902,7 +924,7 @@ export default function Meeting() {
 
             <div className="flex-shrink-0 p-4 border-t border-gray-700/50 bg-gray-800/30">
               <button
-                className="w-full py-3 bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 rounded-xl font-medium shadow-lg hover:shadow-red-500/25 transition-all duration-200 transform hover:scale-[1.02] active:scale-[0.98]"
+                className="w-full py-3 bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 rounded-xl font-medium shadow-lg transition-all duration-200 transform hover:scale-[1.02] active:scale-[0.98]"
                 onClick={handleLeave}
               >
                 Leave Meeting
@@ -911,24 +933,20 @@ export default function Meeting() {
           </div>
         </div>
 
-        {sidebarOpen && (
-          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-30 lg:hidden" onClick={() => setSidebarOpen(false)} />
-        )}
+        {/* Mobile overlay behind sidebar */}
+        {sidebarOpen && <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-30 lg:hidden" onClick={() => setSidebarOpen(false)} />}
       </div>
 
+      {/* Bottom controls */}
       <div className="flex-shrink-0 bg-gradient-to-t from-gray-900 via-gray-800 to-gray-800/95 border-t border-gray-700/50 shadow-2xl backdrop-blur-md">
         <div className="max-w-7xl mx-auto px-4 py-4">
           <div className="flex items-center justify-between gap-4">
             <div className="hidden md:flex items-center gap-3 text-sm text-gray-400">
               <div className="flex items-center gap-2">
-                <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
                 <span className="font-medium">Connected</span>
               </div>
-              {isAdmin && (
-                <span className="px-2 py-1 bg-yellow-600/20 text-yellow-500 rounded text-xs font-semibold">
-                  HOST
-                </span>
-              )}
+              {isAdmin && <span className="px-2 py-1 bg-yellow-600/20 text-yellow-500 rounded text-xs font-semibold">HOST</span>}
             </div>
 
             <div className="flex-1 flex justify-center">
@@ -946,28 +964,12 @@ export default function Meeting() {
             </div>
 
             <div className="flex items-center gap-2">
-              <button
-                className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 rounded-xl font-medium shadow-lg hover:shadow-blue-500/25 transition-all duration-200 transform hover:scale-[1.02] active:scale-[0.98]"
-                onClick={() => {
-                  const newState = !sidebarOpen;
-                  setSidebarOpen(newState);
-                  if (newState && isAdmin && sidebarContent !== "admin") {
-                    // Do nothing forcing change — leave existing selection
-                  }
-                }}
-              >
+              <button className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-blue-600 to-blue-700 rounded-xl font-medium" onClick={() => { const newState = !sidebarOpen; setSidebarOpen(newState); }}>
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
                 </svg>
-                <span className="hidden sm:inline">
-                  {sidebarOpen ? "Hide" : "Show"}{" "}
-                  {isAdmin && sidebarOpen ? sidebarContent.charAt(0).toUpperCase() + sidebarContent.slice(1) : "Chat"}
-                </span>
-                {isAdmin && waitingRoom.length > 0 && !sidebarOpen && (
-                  <span className="bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
-                    {waitingRoom.length}
-                  </span>
-                )}
+                <span className="hidden sm:inline">{sidebarOpen ? "Hide" : "Show"} {isAdmin && sidebarOpen ? sidebarContent.charAt(0).toUpperCase() + sidebarContent.slice(1) : "Chat"}</span>
+                {isAdmin && waitingRoom.length > 0 && !sidebarOpen && <span className="bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">{waitingRoom.length}</span>}
               </button>
             </div>
           </div>
