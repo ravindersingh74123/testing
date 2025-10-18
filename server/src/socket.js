@@ -23,6 +23,11 @@ module.exports = (server) => {
         `\n🚀 [JOIN-MEETING] ${user.name} (${socket.id}) joining ${meetingId}`
       );
 
+      if (socket.meetingId === meetingId && socket.userId) {
+        console.log(`⚠️ [DUPLICATE] ${user.name} already in meeting, ignoring`);
+        return;
+      }
+
       try {
         const meeting = await Meeting.findOne({ meetingId });
 
@@ -352,6 +357,10 @@ module.exports = (server) => {
         );
 
         if (participant) {
+          if (participant.status === "admitted") {
+            console.log(`⚠️ [ADMIT] User already admitted`);
+            return;
+          }
           participant.status = "admitted";
           await meeting.save();
 
@@ -606,6 +615,23 @@ module.exports = (server) => {
 
     socket.on("disconnect", () => {
       console.log(`\n🔌 [DISCONNECT] ${socket.id}`);
+
+      // ✅ ADD: Clean up from database too
+      if (socket.meetingId && socket.userId) {
+        Meeting.findOne({ meetingId: socket.meetingId })
+          .then((meeting) => {
+            if (meeting) {
+              meeting.participants = meeting.participants.filter(
+                (p) =>
+                  p.userId.toString() !== socket.userId.toString() ||
+                  p.status === "waiting" // Keep waiting users
+              );
+              return meeting.save();
+            }
+          })
+          .catch((err) => console.error("❌ [CLEANUP-ERROR]", err));
+      }
+
       if (socket.meetingId) handleUserLeave(socket, socket.meetingId);
     });
 

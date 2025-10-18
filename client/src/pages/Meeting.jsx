@@ -22,6 +22,7 @@ export default function Meeting() {
   const { id: meetingId } = useParams();
   const navigate = useNavigate();
   const localVideoRef = useRef(null);
+  const [hasJoined, setHasJoined] = useState(false);
   const [localStream, setLocalStream] = useState(null);
   const [peers, setPeers] = useState({}); // Change from ref to state!
   const pcsRef = useRef({});
@@ -52,15 +53,13 @@ export default function Meeting() {
 
   console.log("🎬 [MEETING-RENDER] Meeting component rendered");
 
-  useEffect(() => {
-    // ONLY set sidebar content on initial admin status change
-    // Don't reset if sidebar is already open
+ useEffect(() => {
     if (isAdmin && sidebarContent === "chat") {
       setSidebarContent("admin");
     } else if (!isAdmin && sidebarContent === "admin") {
       setSidebarContent("chat");
     }
-  }, [isAdmin]); // Remove sidebarContent from deps to avoid infinite loop
+  }, [isAdmin, sidebarContent]); // ✅ Include sidebarContent but check prevents loop
   // GET LOCAL MEDIA
   useEffect(() => {
     console.log("📹 [MEDIA] Setting up local media");
@@ -108,6 +107,23 @@ export default function Meeting() {
     };
   }, []);
 
+
+  useEffect(() => {
+  if (hasJoined && socketConnectedRef.current) {
+    console.log("⚠️ [SKIP] Already joined this session");
+    return;
+  }
+  
+  // ... rest of socket setup
+  
+  // ✅ After successful join, set the flag in meeting-joined handler:
+  socket.on("meeting-joined", ({ isAdmin: adminStatus, permissions, settings }) => {
+    console.log("🎉 [MEETING-JOINED] Received meeting-joined event");
+    setHasJoined(true); // ✅ Mark as joined
+    // ... rest of existing code
+  });
+  
+}, [meetingId, navigate, hasJoined]); // ✅ Add hasJoined to deps
   // SOCKET CONNECTION & EVENTS
   useEffect(() => {
     if (socketConnectedRef.current && socket.connected) {
@@ -523,7 +539,7 @@ export default function Meeting() {
         setPeersVersion(0);
       }
     };
-  }, [meetingId, navigate, isAdmin]);
+  }, [meetingId, navigate]);
 
   // Process pending offers when local stream becomes available
   // Fix for the useEffect that processes pending offers
